@@ -103,7 +103,7 @@ pub const Shards = struct {
 
 // ── XOR (SIMD) ─────────────────────────────────────────────────────────
 
-pub fn xorChunks(dst: []Chunk, src: []const Chunk) void {
+pub inline fn xorChunks(dst: []Chunk, src: []const Chunk) void {
     for (dst, src) |*d, s| {
         inline for (0..4) |q| {
             const off = q * 16;
@@ -134,7 +134,7 @@ inline fn simdMul16(dl: V16, dh: V16, lo0: V16, lo1: V16, lo2: V16, lo3: V16, hi
     };
 }
 
-fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
+inline fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
     const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
     const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
     const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
@@ -150,7 +150,7 @@ fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
     }
 }
 
-fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
+inline fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
     const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
     const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
     const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
@@ -162,67 +162,129 @@ fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
     }
 }
 
-/// Fused FFT butterfly: a ^= b * lut; b ^= a (single pass, keeps a in registers)
-fn fftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
+/// Fused FFT butterfly: a ^= b * lut; b ^= a
+/// Processes 2 chunks at once when possible for better pipeline utilization.
+inline fn fftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
     const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
     const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
     const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
     const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
 
-    for (a, b) |*ac, *bc| {
-        // First 16 elements
-        const bl: V16 = bc[0..16].*;
-        const bh: V16 = bc[32..48].*;
-        const pl, const ph = simdMul16(bl, bh, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const al: V16 = @as(V16, ac[0..16].*) ^ pl;
-        const ah: V16 = @as(V16, ac[32..48].*) ^ ph;
-        ac[0..16].* = al;       // store a (with product XORed in)
-        ac[32..48].* = ah;
-        bc[0..16].* = bl ^ al;  // b ^= a (uses a still in register)
-        bc[32..48].* = bh ^ ah;
+    // Process pairs of chunks to utilize more NEON registers (32 available)
+    var ci: usize = 0;
+    while (ci + 2 <= a.len) : (ci += 2) {
+        // ── Chunk 0 ──
+        const bl0: V16 = b[ci][0..16].*;
+        const bh0: V16 = b[ci][32..48].*;
+        const pl0, const ph0 = simdMul16(bl0, bh0, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const al0: V16 = @as(V16, a[ci][0..16].*) ^ pl0;
+        const ah0: V16 = @as(V16, a[ci][32..48].*) ^ ph0;
 
-        // Second 16 elements
-        const bl2: V16 = bc[16..32].*;
-        const bh2: V16 = bc[48..64].*;
+        const bl0b: V16 = b[ci][16..32].*;
+        const bh0b: V16 = b[ci][48..64].*;
+        const pl0b, const ph0b = simdMul16(bl0b, bh0b, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const al0b: V16 = @as(V16, a[ci][16..32].*) ^ pl0b;
+        const ah0b: V16 = @as(V16, a[ci][48..64].*) ^ ph0b;
+
+        // ── Chunk 1 (interleaved for pipeline) ──
+        const bl1: V16 = b[ci + 1][0..16].*;
+        const bh1: V16 = b[ci + 1][32..48].*;
+        const pl1, const ph1 = simdMul16(bl1, bh1, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const al1: V16 = @as(V16, a[ci + 1][0..16].*) ^ pl1;
+        const ah1: V16 = @as(V16, a[ci + 1][32..48].*) ^ ph1;
+
+        const bl1b: V16 = b[ci + 1][16..32].*;
+        const bh1b: V16 = b[ci + 1][48..64].*;
+        const pl1b, const ph1b = simdMul16(bl1b, bh1b, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const al1b: V16 = @as(V16, a[ci + 1][16..32].*) ^ pl1b;
+        const ah1b: V16 = @as(V16, a[ci + 1][48..64].*) ^ ph1b;
+
+        // ── Store all results ──
+        a[ci][0..16].* = al0; a[ci][32..48].* = ah0;
+        a[ci][16..32].* = al0b; a[ci][48..64].* = ah0b;
+        b[ci][0..16].* = bl0 ^ al0; b[ci][32..48].* = bh0 ^ ah0;
+        b[ci][16..32].* = bl0b ^ al0b; b[ci][48..64].* = bh0b ^ ah0b;
+
+        a[ci + 1][0..16].* = al1; a[ci + 1][32..48].* = ah1;
+        a[ci + 1][16..32].* = al1b; a[ci + 1][48..64].* = ah1b;
+        b[ci + 1][0..16].* = bl1 ^ al1; b[ci + 1][32..48].* = bh1 ^ ah1;
+        b[ci + 1][16..32].* = bl1b ^ al1b; b[ci + 1][48..64].* = bh1b ^ ah1b;
+    }
+
+    // Handle odd trailing chunk
+    if (ci < a.len) {
+        const bl: V16 = b[ci][0..16].*; const bh: V16 = b[ci][32..48].*;
+        const pl, const ph = simdMul16(bl, bh, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const al: V16 = @as(V16, a[ci][0..16].*) ^ pl;
+        const ah: V16 = @as(V16, a[ci][32..48].*) ^ ph;
+        a[ci][0..16].* = al; a[ci][32..48].* = ah;
+        b[ci][0..16].* = bl ^ al; b[ci][32..48].* = bh ^ ah;
+
+        const bl2: V16 = b[ci][16..32].*; const bh2: V16 = b[ci][48..64].*;
         const pl2, const ph2 = simdMul16(bl2, bh2, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const al2: V16 = @as(V16, ac[16..32].*) ^ pl2;
-        const ah2: V16 = @as(V16, ac[48..64].*) ^ ph2;
-        ac[16..32].* = al2;
-        ac[48..64].* = ah2;
-        bc[16..32].* = bl2 ^ al2;
-        bc[48..64].* = bh2 ^ ah2;
+        const al2: V16 = @as(V16, a[ci][16..32].*) ^ pl2;
+        const ah2: V16 = @as(V16, a[ci][48..64].*) ^ ph2;
+        a[ci][16..32].* = al2; a[ci][48..64].* = ah2;
+        b[ci][16..32].* = bl2 ^ al2; b[ci][48..64].* = bh2 ^ ah2;
     }
 }
 
-/// Fused IFFT butterfly: b ^= a; a ^= b * lut (single pass)
-fn ifftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
+/// Fused IFFT butterfly: b ^= a; a ^= b * lut
+inline fn ifftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
     const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
     const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
     const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
     const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
 
-    for (a, b) |*ac, *bc| {
-        // First 16 elements: b ^= a, then a ^= b*lut
-        const al: V16 = ac[0..16].*;
-        const ah: V16 = ac[32..48].*;
-        const new_bl: V16 = @as(V16, bc[0..16].*) ^ al;
-        const new_bh: V16 = @as(V16, bc[32..48].*) ^ ah;
-        bc[0..16].* = new_bl;
-        bc[32..48].* = new_bh;
-        const pl, const ph = simdMul16(new_bl, new_bh, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        ac[0..16].* = al ^ pl;
-        ac[32..48].* = ah ^ ph;
+    var ci: usize = 0;
+    while (ci + 2 <= a.len) : (ci += 2) {
+        // ── Chunk 0 ──
+        const al0: V16 = a[ci][0..16].*; const ah0: V16 = a[ci][32..48].*;
+        const nb0: V16 = @as(V16, b[ci][0..16].*) ^ al0;
+        const nbh0: V16 = @as(V16, b[ci][32..48].*) ^ ah0;
+        const al0b: V16 = a[ci][16..32].*; const ah0b: V16 = a[ci][48..64].*;
+        const nb0b: V16 = @as(V16, b[ci][16..32].*) ^ al0b;
+        const nbh0b: V16 = @as(V16, b[ci][48..64].*) ^ ah0b;
 
-        // Second 16 elements
-        const al2: V16 = ac[16..32].*;
-        const ah2: V16 = ac[48..64].*;
-        const new_bl2: V16 = @as(V16, bc[16..32].*) ^ al2;
-        const new_bh2: V16 = @as(V16, bc[48..64].*) ^ ah2;
-        bc[16..32].* = new_bl2;
-        bc[48..64].* = new_bh2;
-        const pl2, const ph2 = simdMul16(new_bl2, new_bh2, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        ac[16..32].* = al2 ^ pl2;
-        ac[48..64].* = ah2 ^ ph2;
+        // ── Chunk 1 ──
+        const al1: V16 = a[ci + 1][0..16].*; const ah1: V16 = a[ci + 1][32..48].*;
+        const nb1: V16 = @as(V16, b[ci + 1][0..16].*) ^ al1;
+        const nbh1: V16 = @as(V16, b[ci + 1][32..48].*) ^ ah1;
+        const al1b: V16 = a[ci + 1][16..32].*; const ah1b: V16 = a[ci + 1][48..64].*;
+        const nb1b: V16 = @as(V16, b[ci + 1][16..32].*) ^ al1b;
+        const nbh1b: V16 = @as(V16, b[ci + 1][48..64].*) ^ ah1b;
+
+        // ── Multiply and store ──
+        const p0l, const p0h = simdMul16(nb0, nbh0, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const p0lb, const p0hb = simdMul16(nb0b, nbh0b, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const p1l, const p1h = simdMul16(nb1, nbh1, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const p1lb, const p1hb = simdMul16(nb1b, nbh1b, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+
+        b[ci][0..16].* = nb0; b[ci][32..48].* = nbh0;
+        b[ci][16..32].* = nb0b; b[ci][48..64].* = nbh0b;
+        a[ci][0..16].* = al0 ^ p0l; a[ci][32..48].* = ah0 ^ p0h;
+        a[ci][16..32].* = al0b ^ p0lb; a[ci][48..64].* = ah0b ^ p0hb;
+
+        b[ci + 1][0..16].* = nb1; b[ci + 1][32..48].* = nbh1;
+        b[ci + 1][16..32].* = nb1b; b[ci + 1][48..64].* = nbh1b;
+        a[ci + 1][0..16].* = al1 ^ p1l; a[ci + 1][32..48].* = ah1 ^ p1h;
+        a[ci + 1][16..32].* = al1b ^ p1lb; a[ci + 1][48..64].* = ah1b ^ p1hb;
+    }
+
+    if (ci < a.len) {
+        const al: V16 = a[ci][0..16].*; const ah: V16 = a[ci][32..48].*;
+        const nb: V16 = @as(V16, b[ci][0..16].*) ^ al;
+        const nbh: V16 = @as(V16, b[ci][32..48].*) ^ ah;
+        b[ci][0..16].* = nb; b[ci][32..48].* = nbh;
+        const pl, const ph = simdMul16(nb, nbh, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        a[ci][0..16].* = al ^ pl; a[ci][32..48].* = ah ^ ph;
+
+        const al2: V16 = a[ci][16..32].*; const ah2: V16 = a[ci][48..64].*;
+        const nb2: V16 = @as(V16, b[ci][16..32].*) ^ al2;
+        const nbh2: V16 = @as(V16, b[ci][48..64].*) ^ ah2;
+        b[ci][16..32].* = nb2; b[ci][48..64].* = nbh2;
+        const pl2, const ph2 = simdMul16(nb2, nbh2, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        a[ci][16..32].* = al2 ^ pl2; a[ci][48..64].* = ah2 ^ ph2;
     }
 }
 
@@ -247,18 +309,23 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void { self.allocator.destroy(self.mul128); }
 
     pub fn fft(self: *const Engine, shards: *Shards, pos: usize, size: usize, truncated_size: usize, skew_delta: usize) void {
+        const sl = shards.shard_len;
+        const data = shards.data;
         var dist = size / 2;
         while (dist > 0) : (dist /= 2) {
             var r: usize = 0;
             while (r < truncated_size) : (r += dist * 2) {
                 const log_m = self.skew[r + dist + skew_delta - 1];
-                for (r..r + dist) |i| {
-                    if (log_m != GF_MODULUS) {
-                        // Fused: a ^= b*lut; b ^= a (single pass)
-                        fftButterfly(shards.shardMut(pos + i), shards.shardMut(pos + i + dist), &self.mul128[log_m]);
-                    } else {
-                        // No multiply, just XOR
-                        xorChunks(shards.shardMut(pos + i + dist), shards.shard(pos + i));
+                const base_a = (pos + r) * sl;
+                const base_b = (pos + r + dist) * sl;
+                if (log_m != GF_MODULUS) {
+                    const lut = &self.mul128[log_m];
+                    for (0..dist) |i| {
+                        fftButterfly(data[base_a + i * sl ..][0..sl], data[base_b + i * sl ..][0..sl], lut);
+                    }
+                } else {
+                    for (0..dist) |i| {
+                        xorChunks(data[base_b + i * sl ..][0..sl], data[base_a + i * sl ..][0..sl]);
                     }
                 }
             }
@@ -266,18 +333,23 @@ pub const Engine = struct {
     }
 
     pub fn ifft(self: *const Engine, shards: *Shards, pos: usize, size: usize, truncated_size: usize, skew_delta: usize) void {
+        const sl = shards.shard_len;
+        const data = shards.data;
         var dist: usize = 1;
         while (dist < size) : (dist *= 2) {
             var r: usize = 0;
             while (r < truncated_size) : (r += dist * 2) {
                 const log_m = self.skew[r + dist + skew_delta - 1];
-                for (r..r + dist) |i| {
-                    if (log_m != GF_MODULUS) {
-                        // Fused: b ^= a; a ^= b*lut (single pass)
-                        ifftButterfly(shards.shardMut(pos + i), shards.shardMut(pos + i + dist), &self.mul128[log_m]);
-                    } else {
-                        // No multiply, just XOR
-                        xorChunks(shards.shardMut(pos + i + dist), shards.shard(pos + i));
+                const base_a = (pos + r) * sl;
+                const base_b = (pos + r + dist) * sl;
+                if (log_m != GF_MODULUS) {
+                    const lut = &self.mul128[log_m];
+                    for (0..dist) |i| {
+                        ifftButterfly(data[base_a + i * sl ..][0..sl], data[base_b + i * sl ..][0..sl], lut);
+                    }
+                } else {
+                    for (0..dist) |i| {
+                        xorChunks(data[base_b + i * sl ..][0..sl], data[base_a + i * sl ..][0..sl]);
                     }
                 }
             }
