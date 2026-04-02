@@ -103,12 +103,13 @@ pub const Shards = struct {
 
 // ── XOR (SIMD) ─────────────────────────────────────────────────────────
 
+const V64 = @Vector(64, u8);
+
 pub inline fn xorChunks(dst: []Chunk, src: []const Chunk) void {
     for (dst, src) |*d, s| {
-        inline for (0..4) |q| {
-            const off = q * 16;
-            d[off..][0..16].* = @as(V16, d[off..][0..16].*) ^ @as(V16, s[off..][0..16].*);
-        }
+        const dv: V64 = @bitCast(d.*);
+        const sv: V64 = @bitCast(s);
+        d.* = @bitCast(dv ^ sv);
     }
 }
 
@@ -117,10 +118,9 @@ pub fn xorWithin(shards: *Shards, x: usize, y: usize, count: usize) void {
     const ys = y * shards.shard_len;
     const len = count * shards.shard_len;
     for (0..len) |i| {
-        inline for (0..4) |q| {
-            const off = q * 16;
-            shards.data[xs + i][off..][0..16].* = @as(V16, shards.data[xs + i][off..][0..16].*) ^ @as(V16, shards.data[ys + i][off..][0..16].*);
-        }
+        const dv: V64 = shards.data[xs + i];
+        const sv: V64 = shards.data[ys + i];
+        shards.data[xs + i] = @bitCast(dv ^ sv);
     }
 }
 
@@ -239,17 +239,19 @@ inline fn ifftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
 pub const Engine = struct {
     el: tables.ExpLog,
     skew: tables.Skew,
+    log_walsh: tables.LogWalsh, // cached — avoids recomputing on every decode
     mul128: *[GF_ORDER]gf.Mul128,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator) !Engine {
         const el = tables.initExpLog();
         const skew = tables.initSkew(&el);
+        const log_walsh = tables.initLogWalsh(&el);
         const mul128 = try allocator.create([GF_ORDER]gf.Mul128);
         for (0..GF_ORDER) |log_m| {
             mul128[log_m] = tables.buildMul128Entry(@intCast(log_m), &el);
         }
-        return .{ .el = el, .skew = skew, .mul128 = mul128, .allocator = allocator };
+        return .{ .el = el, .skew = skew, .log_walsh = log_walsh, .mul128 = mul128, .allocator = allocator };
     }
 
     pub fn deinit(self: *Engine) void { self.allocator.destroy(self.mul128); }
@@ -315,10 +317,9 @@ pub const Engine = struct {
     }
 
     pub fn evalPoly(self: *const Engine, erasures: *[GF_ORDER]GfElement, truncated_size: usize) void {
-        const log_walsh = tables.initLogWalsh(&self.el);
         fwht_mod.fwht(erasures, truncated_size);
         for (0..GF_ORDER) |i| {
-            const product: u32 = @as(u32, erasures[i]) * @as(u32, log_walsh[i]);
+            const product: u32 = @as(u32, erasures[i]) * @as(u32, self.log_walsh[i]);
             erasures[i] = gf.addMod(@truncate(product), @truncate(product >> GF_BITS));
         }
         fwht_mod.fwht(erasures, GF_ORDER);
