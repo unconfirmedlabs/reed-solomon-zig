@@ -127,11 +127,29 @@ pub fn xorWithin(shards: *Shards, x: usize, y: usize, count: usize) void {
 // ── SIMD operations (with preloaded tables) ────────────────────────────
 
 /// Inline helper: compute product = data * lut (16 GF elements = 32 bytes lo+hi)
+/// Uses nibble decomposition with 8 table lookups.
 inline fn simdMul16(dl: V16, dh: V16, lo0: V16, lo1: V16, lo2: V16, lo3: V16, hi0: V16, hi1: V16, hi2: V16, hi3: V16) struct { V16, V16 } {
+    const dl_lo = dl & mask_0f;
+    const dl_hi = (dl >> shift_4) & mask_0f;
+    const dh_lo = dh & mask_0f;
+    const dh_hi = (dh >> shift_4) & mask_0f;
     return .{
-        tblLookup(lo0, dl & mask_0f) ^ tblLookup(lo1, (dl >> shift_4) & mask_0f) ^ tblLookup(lo2, dh & mask_0f) ^ tblLookup(lo3, (dh >> shift_4) & mask_0f),
-        tblLookup(hi0, dl & mask_0f) ^ tblLookup(hi1, (dl >> shift_4) & mask_0f) ^ tblLookup(hi2, dh & mask_0f) ^ tblLookup(hi3, (dh >> shift_4) & mask_0f),
+        tblLookup(lo0, dl_lo) ^ tblLookup(lo1, dl_hi) ^ tblLookup(lo2, dh_lo) ^ tblLookup(lo3, dh_hi),
+        tblLookup(hi0, dl_lo) ^ tblLookup(hi1, dl_hi) ^ tblLookup(hi2, dh_lo) ^ tblLookup(hi3, dh_hi),
     };
+}
+
+/// Load a 64-byte chunk as 4 × V16 (enables ldp optimization).
+inline fn loadChunk(c: *const Chunk) struct { V16, V16, V16, V16 } {
+    return .{ c[0..16].*, c[16..32].*, c[32..48].*, c[48..64].* };
+}
+
+/// Store 4 × V16 back to a 64-byte chunk (enables stp optimization).
+inline fn storeChunk(c: *Chunk, v0: V16, v1: V16, v2: V16, v3: V16) void {
+    c[0..16].* = v0;
+    c[16..32].* = v1;
+    c[32..48].* = v2;
+    c[48..64].* = v3;
 }
 
 inline fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
@@ -162,129 +180,57 @@ inline fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
     }
 }
 
-/// Fused FFT butterfly: a ^= b * lut; b ^= a
-/// Processes 2 chunks at once when possible for better pipeline utilization.
+/// Fused FFT butterfly: a ^= b * lut; b ^= a (single pass)
 inline fn fftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
     const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
     const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
     const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
     const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
 
-    // Process pairs of chunks to utilize more NEON registers (32 available)
-    var ci: usize = 0;
-    while (ci + 2 <= a.len) : (ci += 2) {
-        // ── Chunk 0 ──
-        const bl0: V16 = b[ci][0..16].*;
-        const bh0: V16 = b[ci][32..48].*;
-        const pl0, const ph0 = simdMul16(bl0, bh0, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const al0: V16 = @as(V16, a[ci][0..16].*) ^ pl0;
-        const ah0: V16 = @as(V16, a[ci][32..48].*) ^ ph0;
+    for (a, b) |*ac, *bc| {
+        // Load both chunks (4 × V16 each → ldp candidates)
+        const b0, const b1, const b2, const b3 = loadChunk(bc);
+        const a0, const a1, const a2, const a3 = loadChunk(ac);
 
-        const bl0b: V16 = b[ci][16..32].*;
-        const bh0b: V16 = b[ci][48..64].*;
-        const pl0b, const ph0b = simdMul16(bl0b, bh0b, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const al0b: V16 = @as(V16, a[ci][16..32].*) ^ pl0b;
-        const ah0b: V16 = @as(V16, a[ci][48..64].*) ^ ph0b;
+        // Multiply b (lo=b0,b2 hi=b1,b3 in split layout: [0..16]=lo_lo, [16..32]=lo_hi, [32..48]=hi_lo, [48..64]=hi_hi)
+        const pl0, const ph0 = simdMul16(b0, b2, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const pl1, const ph1 = simdMul16(b1, b3, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
 
-        // ── Chunk 1 (interleaved for pipeline) ──
-        const bl1: V16 = b[ci + 1][0..16].*;
-        const bh1: V16 = b[ci + 1][32..48].*;
-        const pl1, const ph1 = simdMul16(bl1, bh1, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const al1: V16 = @as(V16, a[ci + 1][0..16].*) ^ pl1;
-        const ah1: V16 = @as(V16, a[ci + 1][32..48].*) ^ ph1;
+        // a ^= product
+        const na0 = a0 ^ pl0;
+        const na1 = a1 ^ pl1;
+        const na2 = a2 ^ ph0;
+        const na3 = a3 ^ ph1;
 
-        const bl1b: V16 = b[ci + 1][16..32].*;
-        const bh1b: V16 = b[ci + 1][48..64].*;
-        const pl1b, const ph1b = simdMul16(bl1b, bh1b, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const al1b: V16 = @as(V16, a[ci + 1][16..32].*) ^ pl1b;
-        const ah1b: V16 = @as(V16, a[ci + 1][48..64].*) ^ ph1b;
-
-        // ── Store all results ──
-        a[ci][0..16].* = al0; a[ci][32..48].* = ah0;
-        a[ci][16..32].* = al0b; a[ci][48..64].* = ah0b;
-        b[ci][0..16].* = bl0 ^ al0; b[ci][32..48].* = bh0 ^ ah0;
-        b[ci][16..32].* = bl0b ^ al0b; b[ci][48..64].* = bh0b ^ ah0b;
-
-        a[ci + 1][0..16].* = al1; a[ci + 1][32..48].* = ah1;
-        a[ci + 1][16..32].* = al1b; a[ci + 1][48..64].* = ah1b;
-        b[ci + 1][0..16].* = bl1 ^ al1; b[ci + 1][32..48].* = bh1 ^ ah1;
-        b[ci + 1][16..32].* = bl1b ^ al1b; b[ci + 1][48..64].* = bh1b ^ ah1b;
-    }
-
-    // Handle odd trailing chunk
-    if (ci < a.len) {
-        const bl: V16 = b[ci][0..16].*; const bh: V16 = b[ci][32..48].*;
-        const pl, const ph = simdMul16(bl, bh, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const al: V16 = @as(V16, a[ci][0..16].*) ^ pl;
-        const ah: V16 = @as(V16, a[ci][32..48].*) ^ ph;
-        a[ci][0..16].* = al; a[ci][32..48].* = ah;
-        b[ci][0..16].* = bl ^ al; b[ci][32..48].* = bh ^ ah;
-
-        const bl2: V16 = b[ci][16..32].*; const bh2: V16 = b[ci][48..64].*;
-        const pl2, const ph2 = simdMul16(bl2, bh2, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const al2: V16 = @as(V16, a[ci][16..32].*) ^ pl2;
-        const ah2: V16 = @as(V16, a[ci][48..64].*) ^ ph2;
-        a[ci][16..32].* = al2; a[ci][48..64].* = ah2;
-        b[ci][16..32].* = bl2 ^ al2; b[ci][48..64].* = bh2 ^ ah2;
+        // Store a, then b ^= a
+        storeChunk(ac, na0, na1, na2, na3);
+        storeChunk(bc, b0 ^ na0, b1 ^ na1, b2 ^ na2, b3 ^ na3);
     }
 }
 
-/// Fused IFFT butterfly: b ^= a; a ^= b * lut
+/// Fused IFFT butterfly: b ^= a; a ^= b * lut (single pass)
 inline fn ifftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
     const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
     const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
     const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
     const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
 
-    var ci: usize = 0;
-    while (ci + 2 <= a.len) : (ci += 2) {
-        // ── Chunk 0 ──
-        const al0: V16 = a[ci][0..16].*; const ah0: V16 = a[ci][32..48].*;
-        const nb0: V16 = @as(V16, b[ci][0..16].*) ^ al0;
-        const nbh0: V16 = @as(V16, b[ci][32..48].*) ^ ah0;
-        const al0b: V16 = a[ci][16..32].*; const ah0b: V16 = a[ci][48..64].*;
-        const nb0b: V16 = @as(V16, b[ci][16..32].*) ^ al0b;
-        const nbh0b: V16 = @as(V16, b[ci][48..64].*) ^ ah0b;
+    for (a, b) |*ac, *bc| {
+        const a0, const a1, const a2, const a3 = loadChunk(ac);
+        const b0, const b1, const b2, const b3 = loadChunk(bc);
 
-        // ── Chunk 1 ──
-        const al1: V16 = a[ci + 1][0..16].*; const ah1: V16 = a[ci + 1][32..48].*;
-        const nb1: V16 = @as(V16, b[ci + 1][0..16].*) ^ al1;
-        const nbh1: V16 = @as(V16, b[ci + 1][32..48].*) ^ ah1;
-        const al1b: V16 = a[ci + 1][16..32].*; const ah1b: V16 = a[ci + 1][48..64].*;
-        const nb1b: V16 = @as(V16, b[ci + 1][16..32].*) ^ al1b;
-        const nbh1b: V16 = @as(V16, b[ci + 1][48..64].*) ^ ah1b;
+        // b ^= a
+        const nb0 = b0 ^ a0;
+        const nb1 = b1 ^ a1;
+        const nb2 = b2 ^ a2;
+        const nb3 = b3 ^ a3;
 
-        // ── Multiply and store ──
-        const p0l, const p0h = simdMul16(nb0, nbh0, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const p0lb, const p0hb = simdMul16(nb0b, nbh0b, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const p1l, const p1h = simdMul16(nb1, nbh1, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        const p1lb, const p1hb = simdMul16(nb1b, nbh1b, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        // a ^= new_b * lut
+        const pl0, const ph0 = simdMul16(nb0, nb2, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const pl1, const ph1 = simdMul16(nb1, nb3, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
 
-        b[ci][0..16].* = nb0; b[ci][32..48].* = nbh0;
-        b[ci][16..32].* = nb0b; b[ci][48..64].* = nbh0b;
-        a[ci][0..16].* = al0 ^ p0l; a[ci][32..48].* = ah0 ^ p0h;
-        a[ci][16..32].* = al0b ^ p0lb; a[ci][48..64].* = ah0b ^ p0hb;
-
-        b[ci + 1][0..16].* = nb1; b[ci + 1][32..48].* = nbh1;
-        b[ci + 1][16..32].* = nb1b; b[ci + 1][48..64].* = nbh1b;
-        a[ci + 1][0..16].* = al1 ^ p1l; a[ci + 1][32..48].* = ah1 ^ p1h;
-        a[ci + 1][16..32].* = al1b ^ p1lb; a[ci + 1][48..64].* = ah1b ^ p1hb;
-    }
-
-    if (ci < a.len) {
-        const al: V16 = a[ci][0..16].*; const ah: V16 = a[ci][32..48].*;
-        const nb: V16 = @as(V16, b[ci][0..16].*) ^ al;
-        const nbh: V16 = @as(V16, b[ci][32..48].*) ^ ah;
-        b[ci][0..16].* = nb; b[ci][32..48].* = nbh;
-        const pl, const ph = simdMul16(nb, nbh, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        a[ci][0..16].* = al ^ pl; a[ci][32..48].* = ah ^ ph;
-
-        const al2: V16 = a[ci][16..32].*; const ah2: V16 = a[ci][48..64].*;
-        const nb2: V16 = @as(V16, b[ci][16..32].*) ^ al2;
-        const nbh2: V16 = @as(V16, b[ci][48..64].*) ^ ah2;
-        b[ci][16..32].* = nb2; b[ci][48..64].* = nbh2;
-        const pl2, const ph2 = simdMul16(nb2, nbh2, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        a[ci][16..32].* = al2 ^ pl2; a[ci][48..64].* = ah2 ^ ph2;
+        storeChunk(bc, nb0, nb1, nb2, nb3);
+        storeChunk(ac, a0 ^ pl0, a1 ^ pl1, a2 ^ ph0, a3 ^ ph1);
     }
 }
 
