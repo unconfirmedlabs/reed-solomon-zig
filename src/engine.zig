@@ -124,7 +124,15 @@ pub fn xorWithin(shards: *Shards, x: usize, y: usize, count: usize) void {
     }
 }
 
-// ── SIMD mul_add / mul (with preloaded tables) ─────────────────────────
+// ── SIMD operations (with preloaded tables) ────────────────────────────
+
+/// Inline helper: compute product = data * lut (16 GF elements = 32 bytes lo+hi)
+inline fn simdMul16(dl: V16, dh: V16, lo0: V16, lo1: V16, lo2: V16, lo3: V16, hi0: V16, hi1: V16, hi2: V16, hi3: V16) struct { V16, V16 } {
+    return .{
+        tblLookup(lo0, dl & mask_0f) ^ tblLookup(lo1, (dl >> shift_4) & mask_0f) ^ tblLookup(lo2, dh & mask_0f) ^ tblLookup(lo3, (dh >> shift_4) & mask_0f),
+        tblLookup(hi0, dl & mask_0f) ^ tblLookup(hi1, (dl >> shift_4) & mask_0f) ^ tblLookup(hi2, dh & mask_0f) ^ tblLookup(hi3, (dh >> shift_4) & mask_0f),
+    };
+}
 
 fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
     const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
@@ -133,13 +141,12 @@ fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
     const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
 
     for (x, y) |*xc, yc| {
-        const yl: V16 = yc[0..16].*; const yh: V16 = yc[32..48].*;
-        xc[0..16].* = @as(V16, xc[0..16].*) ^ tblLookup(lo0, yl & mask_0f) ^ tblLookup(lo1, (yl >> shift_4) & mask_0f) ^ tblLookup(lo2, yh & mask_0f) ^ tblLookup(lo3, (yh >> shift_4) & mask_0f);
-        xc[32..48].* = @as(V16, xc[32..48].*) ^ tblLookup(hi0, yl & mask_0f) ^ tblLookup(hi1, (yl >> shift_4) & mask_0f) ^ tblLookup(hi2, yh & mask_0f) ^ tblLookup(hi3, (yh >> shift_4) & mask_0f);
-
-        const yl2: V16 = yc[16..32].*; const yh2: V16 = yc[48..64].*;
-        xc[16..32].* = @as(V16, xc[16..32].*) ^ tblLookup(lo0, yl2 & mask_0f) ^ tblLookup(lo1, (yl2 >> shift_4) & mask_0f) ^ tblLookup(lo2, yh2 & mask_0f) ^ tblLookup(lo3, (yh2 >> shift_4) & mask_0f);
-        xc[48..64].* = @as(V16, xc[48..64].*) ^ tblLookup(hi0, yl2 & mask_0f) ^ tblLookup(hi1, (yl2 >> shift_4) & mask_0f) ^ tblLookup(hi2, yh2 & mask_0f) ^ tblLookup(hi3, (yh2 >> shift_4) & mask_0f);
+        const pl, const ph = simdMul16(yc[0..16].*, yc[32..48].*, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        xc[0..16].* = @as(V16, xc[0..16].*) ^ pl;
+        xc[32..48].* = @as(V16, xc[32..48].*) ^ ph;
+        const pl2, const ph2 = simdMul16(yc[16..32].*, yc[48..64].*, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        xc[16..32].* = @as(V16, xc[16..32].*) ^ pl2;
+        xc[48..64].* = @as(V16, xc[48..64].*) ^ ph2;
     }
 }
 
@@ -150,13 +157,72 @@ fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
     const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
 
     for (x) |*c| {
-        const dl: V16 = c[0..16].*; const dh: V16 = c[32..48].*;
-        c[0..16].* = tblLookup(lo0, dl & mask_0f) ^ tblLookup(lo1, (dl >> shift_4) & mask_0f) ^ tblLookup(lo2, dh & mask_0f) ^ tblLookup(lo3, (dh >> shift_4) & mask_0f);
-        c[32..48].* = tblLookup(hi0, dl & mask_0f) ^ tblLookup(hi1, (dl >> shift_4) & mask_0f) ^ tblLookup(hi2, dh & mask_0f) ^ tblLookup(hi3, (dh >> shift_4) & mask_0f);
+        c[0..16].*, c[32..48].* = simdMul16(c[0..16].*, c[32..48].*, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        c[16..32].*, c[48..64].* = simdMul16(c[16..32].*, c[48..64].*, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+    }
+}
 
-        const dl2: V16 = c[16..32].*; const dh2: V16 = c[48..64].*;
-        c[16..32].* = tblLookup(lo0, dl2 & mask_0f) ^ tblLookup(lo1, (dl2 >> shift_4) & mask_0f) ^ tblLookup(lo2, dh2 & mask_0f) ^ tblLookup(lo3, (dh2 >> shift_4) & mask_0f);
-        c[48..64].* = tblLookup(hi0, dl2 & mask_0f) ^ tblLookup(hi1, (dl2 >> shift_4) & mask_0f) ^ tblLookup(hi2, dh2 & mask_0f) ^ tblLookup(hi3, (dh2 >> shift_4) & mask_0f);
+/// Fused FFT butterfly: a ^= b * lut; b ^= a (single pass, keeps a in registers)
+fn fftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
+    const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
+    const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
+    const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
+    const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
+
+    for (a, b) |*ac, *bc| {
+        // First 16 elements
+        const bl: V16 = bc[0..16].*;
+        const bh: V16 = bc[32..48].*;
+        const pl, const ph = simdMul16(bl, bh, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const al: V16 = @as(V16, ac[0..16].*) ^ pl;
+        const ah: V16 = @as(V16, ac[32..48].*) ^ ph;
+        ac[0..16].* = al;       // store a (with product XORed in)
+        ac[32..48].* = ah;
+        bc[0..16].* = bl ^ al;  // b ^= a (uses a still in register)
+        bc[32..48].* = bh ^ ah;
+
+        // Second 16 elements
+        const bl2: V16 = bc[16..32].*;
+        const bh2: V16 = bc[48..64].*;
+        const pl2, const ph2 = simdMul16(bl2, bh2, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        const al2: V16 = @as(V16, ac[16..32].*) ^ pl2;
+        const ah2: V16 = @as(V16, ac[48..64].*) ^ ph2;
+        ac[16..32].* = al2;
+        ac[48..64].* = ah2;
+        bc[16..32].* = bl2 ^ al2;
+        bc[48..64].* = bh2 ^ ah2;
+    }
+}
+
+/// Fused IFFT butterfly: b ^= a; a ^= b * lut (single pass)
+fn ifftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
+    const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
+    const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
+    const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
+    const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
+
+    for (a, b) |*ac, *bc| {
+        // First 16 elements: b ^= a, then a ^= b*lut
+        const al: V16 = ac[0..16].*;
+        const ah: V16 = ac[32..48].*;
+        const new_bl: V16 = @as(V16, bc[0..16].*) ^ al;
+        const new_bh: V16 = @as(V16, bc[32..48].*) ^ ah;
+        bc[0..16].* = new_bl;
+        bc[32..48].* = new_bh;
+        const pl, const ph = simdMul16(new_bl, new_bh, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        ac[0..16].* = al ^ pl;
+        ac[32..48].* = ah ^ ph;
+
+        // Second 16 elements
+        const al2: V16 = ac[16..32].*;
+        const ah2: V16 = ac[48..64].*;
+        const new_bl2: V16 = @as(V16, bc[16..32].*) ^ al2;
+        const new_bh2: V16 = @as(V16, bc[48..64].*) ^ ah2;
+        bc[16..32].* = new_bl2;
+        bc[48..64].* = new_bh2;
+        const pl2, const ph2 = simdMul16(new_bl2, new_bh2, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
+        ac[16..32].* = al2 ^ pl2;
+        ac[48..64].* = ah2 ^ ph2;
     }
 }
 
@@ -187,10 +253,13 @@ pub const Engine = struct {
             while (r < truncated_size) : (r += dist * 2) {
                 const log_m = self.skew[r + dist + skew_delta - 1];
                 for (r..r + dist) |i| {
-                    const a = shards.shardMut(pos + i);
-                    const b = shards.shard(pos + i + dist);
-                    if (log_m != GF_MODULUS) mulAdd(a, b, &self.mul128[log_m]);
-                    xorChunks(shards.shardMut(pos + i + dist), a);
+                    if (log_m != GF_MODULUS) {
+                        // Fused: a ^= b*lut; b ^= a (single pass)
+                        fftButterfly(shards.shardMut(pos + i), shards.shardMut(pos + i + dist), &self.mul128[log_m]);
+                    } else {
+                        // No multiply, just XOR
+                        xorChunks(shards.shardMut(pos + i + dist), shards.shard(pos + i));
+                    }
                 }
             }
         }
@@ -203,11 +272,12 @@ pub const Engine = struct {
             while (r < truncated_size) : (r += dist * 2) {
                 const log_m = self.skew[r + dist + skew_delta - 1];
                 for (r..r + dist) |i| {
-                    const a = shards.shard(pos + i);
-                    xorChunks(shards.shardMut(pos + i + dist), a);
                     if (log_m != GF_MODULUS) {
-                        const b = shards.shard(pos + i + dist);
-                        mulAdd(shards.shardMut(pos + i), b, &self.mul128[log_m]);
+                        // Fused: b ^= a; a ^= b*lut (single pass)
+                        ifftButterfly(shards.shardMut(pos + i), shards.shardMut(pos + i + dist), &self.mul128[log_m]);
+                    } else {
+                        // No multiply, just XOR
+                        xorChunks(shards.shardMut(pos + i + dist), shards.shard(pos + i));
                     }
                 }
             }
