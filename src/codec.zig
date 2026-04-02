@@ -65,10 +65,13 @@ pub const Encoder = struct {
         const shard_len_64 = (shard_bytes + 63) / 64; // round up to 64-byte chunks
         const total = nextPow2(original_count + recovery_count);
 
-        const shards = Shards.init(allocator, total, shard_len_64) catch return Error.OutOfMemory;
+        var shards = Shards.init(allocator, total, shard_len_64) catch return Error.OutOfMemory;
+        errdefer shards.deinit();
+        var eng = Engine.init(allocator) catch return Error.OutOfMemory;
+        errdefer eng.deinit();
 
         return .{
-            .engine = Engine.init(allocator) catch return Error.OutOfMemory,
+            .engine = eng,
             .original_count = original_count,
             .recovery_count = recovery_count,
             .shard_bytes = shard_bytes,
@@ -248,12 +251,16 @@ pub const Decoder = struct {
             work_count = nextPow2(chunk_size + recovery_count);
         }
 
-        const shards = Shards.init(allocator, work_count, shard_len_64) catch return Error.OutOfMemory;
+        var shards = Shards.init(allocator, work_count, shard_len_64) catch return Error.OutOfMemory;
+        errdefer shards.deinit();
         const received = allocator.alloc(bool, work_count) catch return Error.OutOfMemory;
+        errdefer allocator.free(received);
         @memset(received, false);
+        var eng = Engine.init(allocator) catch return Error.OutOfMemory;
+        errdefer eng.deinit();
 
         return .{
-            .engine = Engine.init(allocator) catch return Error.OutOfMemory,
+            .engine = eng,
             .original_count = original_count,
             .recovery_count = recovery_count,
             .shard_bytes = shard_bytes,

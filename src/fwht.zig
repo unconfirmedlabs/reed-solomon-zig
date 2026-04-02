@@ -26,21 +26,21 @@ pub fn fwht(data: *[GF_ORDER]GfElement, truncated: usize) void {
     }
 }
 
-fn fwht4(data: *[GF_ORDER]GfElement, offset: usize, dist: usize) void {
-    const @"i0" = offset;
-    const @"i1" = offset + dist;
-    const @"i2" = offset + dist * 2;
-    const @"i3" = offset + dist * 3;
+inline fn fwht4(data: *[GF_ORDER]GfElement, offset: usize, dist: usize) void {
+    const idx0 = offset;
+    const idx1 = offset + dist;
+    const idx2 = offset + dist * 2;
+    const idx3 = offset + dist * 3;
 
-    const s0, const d0 = fwht2(data[@"i0"], data[@"i1"]);
-    const s1, const d1 = fwht2(data[@"i2"], data[@"i3"]);
+    const s0, const d0 = fwht2(data[idx0], data[idx1]);
+    const s1, const d1 = fwht2(data[idx2], data[idx3]);
     const s2, const d2 = fwht2(s0, s1);
     const s3, const d3 = fwht2(d0, d1);
 
-    data[@"i0"] = s2;
-    data[@"i1"] = s3;
-    data[@"i2"] = d2;
-    data[@"i3"] = d3;
+    data[idx0] = s2;
+    data[idx1] = s3;
+    data[idx2] = d2;
+    data[idx3] = d3;
 }
 
 inline fn fwht2(a: GfElement, b: GfElement) struct { GfElement, GfElement } {

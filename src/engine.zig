@@ -4,7 +4,7 @@
 //! Uses 2-layer butterfly optimization for FFT/IFFT (processes 4 shards at once).
 
 const std = @import("std");
-const builtin = @import("builtin");
+// builtin no longer needed — tblLookup imported from gf.zig
 const gf = @import("gf.zig");
 const tables = @import("tables.zig");
 const fwht_mod = @import("fwht.zig");
@@ -17,23 +17,7 @@ const Allocator = std.mem.Allocator;
 // ── SIMD primitives ────────────────────────────────────────────────────
 
 const V16 = @Vector(16, u8);
-const use_neon = (builtin.cpu.arch == .aarch64);
-
-inline fn tblLookup(table: V16, indices: V16) V16 {
-    if (comptime use_neon) {
-        return asm ("tbl %[out].16b, {%[tbl].16b}, %[idx].16b"
-            : [out] "=w" (-> V16),
-            : [tbl] "w" (table),
-              [idx] "w" (indices),
-        );
-    } else {
-        var result: [16]u8 = undefined;
-        const t: [16]u8 = table;
-        const idx: [16]u8 = indices;
-        inline for (0..16) |i| result[i] = t[idx[i] & 0x0f];
-        return result;
-    }
-}
+const tblLookup = gf.tblLookup;
 
 const mask_0f: V16 = @splat(0x0f);
 const shift_4: @Vector(16, u3) = @splat(4);
@@ -113,7 +97,7 @@ pub inline fn xorChunks(dst: []Chunk, src: []const Chunk) void {
     }
 }
 
-pub fn xorWithin(shards: *Shards, x: usize, y: usize, count: usize) void {
+pub inline fn xorWithin(shards: *Shards, x: usize, y: usize, count: usize) void {
     const xs = x * shards.shard_len;
     const ys = y * shards.shard_len;
     const len = count * shards.shard_len;

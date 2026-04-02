@@ -137,16 +137,24 @@ pub fn buildMul128(log_m: GfElement) Mul128 {
 
 // ── SIMD table lookup ──────────────────────────────────────────────────
 
-/// 16-byte table lookup — maps to tbl (ARM) or pshufb (x86).
-inline fn tblLookup(table: @Vector(16, u8), indices: @Vector(16, u8)) @Vector(16, u8) {
+/// 16-byte SIMD table lookup.
+/// ARM AArch64: tbl instruction (NEON)
+/// x86/x86_64 with SSSE3: pshufb instruction
+/// Fallback: scalar loop
+pub inline fn tblLookup(table: @Vector(16, u8), indices: @Vector(16, u8)) @Vector(16, u8) {
     if (comptime builtin.cpu.arch == .aarch64) {
         return asm ("tbl %[out].16b, {%[tbl].16b}, %[idx].16b"
             : [out] "=w" (-> @Vector(16, u8)),
             : [tbl] "w" (table),
               [idx] "w" (indices),
         );
+    } else if (comptime (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86)) {
+        // SSSE3 pshufb — equivalent to tbl for 16-byte table lookup
+        return asm ("pshufb %[idx], %[out]"
+            : [out] "+x" (table),
+            : [idx] "x" (indices),
+        );
     } else {
-        // Scalar fallback (also works on x86 without SSSE3)
         var result: [16]u8 = undefined;
         const t: [16]u8 = table;
         const idx: [16]u8 = indices;
