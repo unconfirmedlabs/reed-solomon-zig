@@ -1,0 +1,11 @@
+.{
+    .name = .reed_solomon,
+    .version = "0.1.0",
+    .fingerprint = 0x3ba574ec37158521,
+    .minimum_zig_version = "0.15.0",
+    .paths = .{
+        "src",
+        "build.zig",
+        "build.zig.zon",
+    },
+}
