@@ -149,12 +149,14 @@ pub inline fn tblLookup(table: @Vector(16, u8), indices: @Vector(16, u8)) @Vecto
               [idx] "w" (indices),
         );
     } else if (comptime (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86)) {
-        // SSSE3 pshufb — modifies first operand in-place
-        var result = table;
-        asm volatile ("pshufb %[idx], %[out]"
-            : [out] "+x" (result),
-            : [idx] "x" (indices),
-        );
+        // SSSE3 pshufb — use scalar fallback for now due to Zig x86 asm encoder issues
+        // TODO: re-enable when Zig's x86 inline asm handles xmm register class correctly
+        var result: [16]u8 = undefined;
+        const t: [16]u8 = table;
+        const idx: [16]u8 = indices;
+        inline for (0..16) |i| {
+            result[i] = t[idx[i] & 0x0f];
+        }
         return result;
     } else {
         var result: [16]u8 = undefined;
