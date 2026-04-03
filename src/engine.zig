@@ -246,7 +246,7 @@ const SharedTables = struct {
 };
 
 var shared_tables: SharedTables = undefined;
-var shared_tables_once = std.once(initSharedTables);
+var shared_tables_initialized: bool = false;
 
 fn initSharedTables() void {
     const el = tables.initExpLog();
@@ -258,7 +258,10 @@ fn initSharedTables() void {
 }
 
 fn getSharedTables() *const SharedTables {
-    shared_tables_once.call();
+    if (!shared_tables_initialized) {
+        initSharedTables();
+        shared_tables_initialized = true;
+    }
     return &shared_tables;
 }
 
