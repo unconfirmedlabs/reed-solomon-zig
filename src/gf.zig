@@ -150,8 +150,9 @@ pub inline fn tblLookup(table: @Vector(16, u8), indices: @Vector(16, u8)) @Vecto
         );
     } else if (comptime (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86)) {
         // SSSE3 pshufb — equivalent to tbl for 16-byte table lookup
+        var result = table;
         return asm ("pshufb %[idx], %[out]"
-            : [out] "+x" (table),
+            : [out] "+x" (result),
             : [idx] "x" (indices),
         );
     } else {
