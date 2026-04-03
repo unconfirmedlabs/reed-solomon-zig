@@ -18,7 +18,12 @@ const Allocator = std.mem.Allocator;
 
 const V16 = @Vector(16, u8);
 const tblLookup = gf.tblLookup;
-const use_x86_avx2 = (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86);
+const use_x86_avx2 = blk: {
+    const arch = builtin.cpu.arch;
+    if (arch != .x86_64 and arch != .x86) break :blk false;
+    // Check if target CPU has AVX2 + SSSE3
+    break :blk std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+};
 
 const mask_0f: V16 = @splat(0x0f);
 const shift_4: @Vector(16, u3) = @splat(4);
@@ -267,7 +272,7 @@ const SharedTables = struct {
 };
 
 var shared_tables: SharedTables = undefined;
-var shared_tables_initialized: bool = false;
+var shared_tables_initialized = std.atomic.Value(bool).init(false);
 
 fn initSharedTables() void {
     const el = tables.initExpLog();
@@ -279,9 +284,9 @@ fn initSharedTables() void {
 }
 
 fn getSharedTables() *const SharedTables {
-    if (!shared_tables_initialized) {
+    if (!shared_tables_initialized.load(.acquire)) {
         initSharedTables();
-        shared_tables_initialized = true;
+        shared_tables_initialized.store(true, .release);
     }
     return &shared_tables;
 }

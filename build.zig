@@ -10,9 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // On x86, compile AVX2 C SIMD implementation
+    // On x86 with AVX2, compile the C SIMD implementation
     const resolved = target.result;
-    if (resolved.cpu.arch == .x86_64 or resolved.cpu.arch == .x86) {
+    const is_x86 = resolved.cpu.arch == .x86_64 or resolved.cpu.arch == .x86;
+    const has_avx2 = is_x86 and std.Target.x86.featureSetHas(resolved.cpu.features, .avx2);
+
+    if (has_avx2) {
         mod.addCSourceFile(.{
             .file = b.path("src/simd_x86.c"),
             .flags = &.{ "-mavx2", "-mssse3", "-O3" },

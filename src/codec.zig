@@ -26,20 +26,83 @@ pub const Error = error{
 
 /// Find the next power of 2 >= n.
 fn nextPow2(n: usize) usize {
-    if (n == 0) return 1;
-    var v = n - 1;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    v |= v >> 32;
-    return v + 1;
+    if (n <= 1) return 1;
+    // Use @clz for a portable, branch-free implementation
+    const bits = @bitSizeOf(usize);
+    const leading = @clz(n - 1);
+    return @as(usize, 1) << @intCast(bits - leading);
 }
 
 /// Round up to next multiple of `chunk_size`.
 fn nextPow2Multiple(n: usize, chunk_size: usize) usize {
     return ((n + chunk_size - 1) / chunk_size) * chunk_size;
+}
+
+// ── Public helpers ─────────────────────────────────────────────────────
+
+/// Returns true if the given shard counts are supported.
+pub fn supports(original_count: usize, recovery_count: usize) bool {
+    return supportsShardCounts(original_count, recovery_count);
+}
+
+/// Returns the total size in bytes of the recovery data for the given configuration.
+pub fn serializedSize(original_count: usize, recovery_count: usize, shard_bytes: usize) ?usize {
+    if (!supportsShardCounts(original_count, recovery_count)) return null;
+    if (shard_bytes == 0 or shard_bytes % 2 != 0) return null;
+    return recovery_count * shard_bytes;
+}
+
+/// Encode in one call. Allocates encoder internally.
+pub fn encode(
+    allocator: Allocator,
+    original_count: usize,
+    recovery_count: usize,
+    shard_bytes: usize,
+    originals: []const []const u8,
+    recovery_out: []u8,
+) Error!void {
+    var enc = try Encoder.init(allocator, original_count, recovery_count, shard_bytes);
+    defer enc.deinit();
+    for (originals) |shard| try enc.addOriginal(shard);
+    try enc.encode(recovery_out);
+}
+
+/// Decode in one call. Allocates decoder internally.
+/// `original_indices` and `original_shards` are the surviving originals.
+/// `recovery_indices` and `recovery_shards` are the available recovery shards.
+/// Returns the number of restored shards.
+pub fn decode(
+    allocator: Allocator,
+    original_count: usize,
+    recovery_count: usize,
+    shard_bytes: usize,
+    original_indices: []const usize,
+    original_shards: []const []const u8,
+    recovery_indices: []const usize,
+    recovery_shards: []const []const u8,
+    restored_out: []u8,
+    restored_indices: []usize,
+) Error!usize {
+    var dec = try Decoder.init(allocator, original_count, recovery_count, shard_bytes);
+    defer dec.deinit();
+    for (original_indices, original_shards) |idx, shard| try dec.addOriginal(idx, shard);
+    for (recovery_indices, recovery_shards) |idx, shard| try dec.addRecovery(idx, shard);
+    return dec.decode(restored_out, restored_indices);
+}
+
+// ── Internal helpers ───────────────────────────────────────────────────
+
+fn extractShard(shard_bytes: usize, chunks: []const engine_mod.Chunk, out: []u8) void {
+    const whole = shard_bytes / 64;
+    const tail = shard_bytes % 64;
+    for (0..whole) |i| {
+        @memcpy(out[i * 64 ..][0..64], &chunks[i]);
+    }
+    if (tail > 0) {
+        const half = tail / 2;
+        @memcpy(out[whole * 64 ..][0..half], chunks[whole][0..half]);
+        @memcpy(out[whole * 64 + half ..][0..half], chunks[whole][32 .. 32 + half]);
+    }
 }
 
 fn supportsShardCounts(original_count: usize, recovery_count: usize) bool {
@@ -99,6 +162,27 @@ pub const Encoder = struct {
         self.engine.deinit();
     }
 
+    /// Reset the encoder to a new configuration, reusing the engine's shared tables.
+    pub fn reset(self: *Encoder, original_count: usize, recovery_count: usize, shard_bytes: usize) Error!void {
+        if (original_count == 0 or recovery_count == 0 or shard_bytes == 0)
+            return Error.InvalidArgs;
+        if (shard_bytes % 2 != 0)
+            return Error.ShardSizeNotEven;
+        if (!supportsShardCounts(original_count, recovery_count))
+            return Error.InvalidArgs;
+
+        const shard_len_64 = (shard_bytes + 63) / 64;
+        const total = nextPow2(original_count + recovery_count);
+
+        self.shards.deinit();
+        self.shards = Shards.init(self.allocator, total, shard_len_64) catch return Error.OutOfMemory;
+        self.original_count = original_count;
+        self.recovery_count = recovery_count;
+        self.shard_bytes = shard_bytes;
+        self.shard_len_64 = shard_len_64;
+        self.added = 0;
+    }
+
     /// Add an original shard (must be called exactly `original_count` times in order).
     pub fn addOriginal(self: *Encoder, data: []const u8) Error!void {
         if (self.added >= self.original_count) return Error.TooManyOriginal;
@@ -127,7 +211,7 @@ pub const Encoder = struct {
         // Low rate: recovery at [0..recovery_count]
         for (0..self.recovery_count) |i| {
             const shard_data = self.shards.shard(i);
-            self.extractShard(shard_data, out[i * self.shard_bytes ..]);
+            extractShard(self.shard_bytes, shard_data, out[i * self.shard_bytes ..]);
         }
 
         // Reset for reuse
@@ -197,20 +281,6 @@ pub const Encoder = struct {
         _ = work_count;
     }
 
-    fn extractShard(self: *const Encoder, chunks: []const engine_mod.Chunk, out: []u8) void {
-        const whole = self.shard_bytes / 64;
-        const tail = self.shard_bytes % 64;
-
-        for (0..whole) |i| {
-            @memcpy(out[i * 64 ..][0..64], &chunks[i]);
-        }
-
-        if (tail > 0) {
-            const half = tail / 2;
-            @memcpy(out[whole * 64 ..][0..half], chunks[whole][0..half]);
-            @memcpy(out[whole * 64 + half ..][0..half], chunks[whole][32 .. 32 + half]);
-        }
-    }
 };
 
 // ── Decoder ────────────────────────────────────────────────────────────
@@ -295,6 +365,53 @@ pub const Decoder = struct {
         self.allocator.free(self.received);
     }
 
+    /// Reset the decoder to a new configuration, reusing the engine's shared tables.
+    pub fn reset(self: *Decoder, original_count: usize, recovery_count: usize, shard_bytes: usize) Error!void {
+        if (original_count == 0 or recovery_count == 0 or shard_bytes == 0)
+            return Error.InvalidArgs;
+        if (shard_bytes % 2 != 0)
+            return Error.ShardSizeNotEven;
+        if (!supportsShardCounts(original_count, recovery_count))
+            return Error.InvalidArgs;
+
+        const shard_len_64 = (shard_bytes + 63) / 64;
+        const high_rate = useHighRate(original_count, recovery_count);
+
+        var original_base: usize = undefined;
+        var recovery_base: usize = undefined;
+        var work_count: usize = undefined;
+
+        if (high_rate) {
+            const chunk_size = nextPow2(recovery_count);
+            original_base = chunk_size;
+            recovery_base = 0;
+            work_count = nextPow2(chunk_size + original_count);
+        } else {
+            const chunk_size = nextPow2(original_count);
+            original_base = 0;
+            recovery_base = chunk_size;
+            work_count = nextPow2(chunk_size + recovery_count);
+        }
+
+        self.shards.deinit();
+        self.allocator.free(self.received);
+
+        self.shards = Shards.init(self.allocator, work_count, shard_len_64) catch return Error.OutOfMemory;
+        self.received = self.allocator.alloc(bool, work_count) catch return Error.OutOfMemory;
+        @memset(self.received, false);
+
+        self.original_count = original_count;
+        self.recovery_count = recovery_count;
+        self.shard_bytes = shard_bytes;
+        self.shard_len_64 = shard_len_64;
+        self.high_rate = high_rate;
+        self.original_base = original_base;
+        self.recovery_base = recovery_base;
+        self.work_count = work_count;
+        self.original_recv_count = 0;
+        self.recovery_recv_count = 0;
+    }
+
     pub fn addOriginal(self: *Decoder, index: usize, data: []const u8) Error!void {
         if (index >= self.original_count) return Error.InvalidArgs;
         if (data.len != self.shard_bytes) return Error.ShardSizeMismatch;
@@ -317,7 +434,13 @@ pub const Decoder = struct {
 
     /// Decode missing original shards.
     /// Returns the number of restored shards.
+    /// `restored_out` must be at least `original_count * shard_bytes` bytes.
+    /// `restored_indices` must be at least `original_count` entries.
     pub fn decode(self: *Decoder, restored_out: []u8, restored_indices: []usize) Error!usize {
+        if (restored_out.len < self.original_count * self.shard_bytes)
+            return Error.InvalidArgs;
+        if (restored_indices.len < self.original_count)
+            return Error.InvalidArgs;
         if (self.original_recv_count + self.recovery_recv_count < self.original_count)
             return Error.TooFewShards;
 
@@ -342,7 +465,7 @@ pub const Decoder = struct {
         for (0..self.original_count) |i| {
             if (!self.received[self.original_base + i]) {
                 const shard_data = self.shards.shard(self.original_base + i);
-                self.extractShard(shard_data, restored_out[count * self.shard_bytes ..]);
+                extractShard(self.shard_bytes, shard_data, restored_out[count * self.shard_bytes ..]);
                 restored_indices[count] = i;
                 count += 1;
             }
@@ -461,21 +584,6 @@ pub const Decoder = struct {
             if (!self.received[i]) {
                 self.engine.mul(self.shards.shardMut(i), GF_MODULUS -| erasures[i]);
             }
-        }
-    }
-
-    fn extractShard(self: *const Decoder, chunks: []const engine_mod.Chunk, out: []u8) void {
-        const whole = self.shard_bytes / 64;
-        const tail = self.shard_bytes % 64;
-
-        for (0..whole) |i| {
-            @memcpy(out[i * 64 ..][0..64], &chunks[i]);
-        }
-
-        if (tail > 0) {
-            const half = tail / 2;
-            @memcpy(out[whole * 64 ..][0..half], chunks[whole][0..half]);
-            @memcpy(out[whole * 64 + half ..][0..half], chunks[whole][32 .. 32 + half]);
         }
     }
 

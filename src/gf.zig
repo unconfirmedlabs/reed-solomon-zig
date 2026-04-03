@@ -75,8 +75,9 @@ pub inline fn mul(a: GfElement, b: GfElement) GfElement {
     return exp_table[addMod(log_table[a], log_table[b])];
 }
 
-/// Multiplicative inverse.
+/// Multiplicative inverse. Returns 0 for inv(0) (mathematically undefined).
 pub inline fn inv(a: GfElement) GfElement {
+    if (a == 0) return 0;
     return exp_table[GF_MODULUS - log_table[a]];
 }
 
