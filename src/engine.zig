@@ -24,9 +24,10 @@ const mask_0f: V16 = @splat(0x0f);
 const shift_4: @Vector(16, u3) = @splat(4);
 
 // x86 AVX2 C FFI (from simd_x86.c, compiled with -mavx2)
-extern "c" fn gf_fft_butterfly_avx2(a: [*]u8, b: [*]const u8, lut: *const gf.Mul128) void;
-extern "c" fn gf_ifft_butterfly_avx2(a: [*]u8, b: [*]u8, lut: *const gf.Mul128) void;
-extern "c" fn gf_mul_avx2(x: [*]u8, lut: *const gf.Mul128) void;
+// Process N chunks per call — tables loaded once, applied to all chunks.
+extern "c" fn gf_fft_butterfly_avx2(a: [*]u8, b: [*]u8, lut: *const gf.Mul128, n_chunks: usize) void;
+extern "c" fn gf_ifft_butterfly_avx2(a: [*]u8, b: [*]u8, lut: *const gf.Mul128, n_chunks: usize) void;
+extern "c" fn gf_mul_avx2(x: [*]u8, lut: *const gf.Mul128, n_chunks: usize) void;
 
 // ── Shard types ────────────────────────────────────────────────────────
 
@@ -167,7 +168,7 @@ inline fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
 
 inline fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
     if (comptime use_x86_avx2) {
-        for (x) |*c| gf_mul_avx2(@ptrCast(c), lut);
+        gf_mul_avx2(@ptrCast(x.ptr), lut, x.len);
         return;
     }
     const lo0: V16 = lut.lo[0];
@@ -186,13 +187,11 @@ inline fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
 }
 
 /// Fused FFT butterfly: a ^= b * lut; b ^= a
-/// On x86: dispatches to AVX2 C implementation (vpshufb, 256-bit)
-/// On ARM: uses Zig NEON tbl (128-bit)
+/// On x86: AVX2 C FFI (tables loaded once for all chunks)
+/// On ARM: Zig NEON tbl
 inline fn fftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
     if (comptime use_x86_avx2) {
-        for (a, b) |*ac, *bc| {
-            gf_fft_butterfly_avx2(@ptrCast(ac), @ptrCast(bc), lut);
-        }
+        gf_fft_butterfly_avx2(@ptrCast(a.ptr), @ptrCast(b.ptr), lut, a.len);
         return;
     }
     const lo0: V16 = lut.lo[0];
@@ -228,9 +227,7 @@ inline fn fftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
 /// Fused IFFT butterfly: b ^= a; a ^= b * lut
 inline fn ifftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
     if (comptime use_x86_avx2) {
-        for (a, b) |*ac, *bc| {
-            gf_ifft_butterfly_avx2(@ptrCast(ac), @ptrCast(bc), lut);
-        }
+        gf_ifft_butterfly_avx2(@ptrCast(a.ptr), @ptrCast(b.ptr), lut, a.len);
         return;
     }
     const lo0: V16 = lut.lo[0];
