@@ -42,6 +42,18 @@ fn nextPow2Multiple(n: usize, chunk_size: usize) usize {
     return ((n + chunk_size - 1) / chunk_size) * chunk_size;
 }
 
+fn supportsShardCounts(original_count: usize, recovery_count: usize) bool {
+    if (original_count == 0 or recovery_count == 0) return false;
+    if (original_count >= GF_ORDER or recovery_count >= GF_ORDER) return false;
+
+    const o_pow2 = nextPow2(original_count);
+    const r_pow2 = nextPow2(recovery_count);
+    const smaller_pow2 = @min(o_pow2, r_pow2);
+    const larger = @max(original_count, recovery_count);
+
+    return smaller_pow2 <= GF_ORDER - larger;
+}
+
 // ── Encoder ────────────────────────────────────────────────────────────
 
 pub const Encoder = struct {
@@ -59,8 +71,8 @@ pub const Encoder = struct {
             return Error.InvalidArgs;
         if (shard_bytes % 2 != 0)
             return Error.ShardSizeNotEven;
-        if (original_count + recovery_count > GF_ORDER)
-            return Error.TooManyOriginal;
+        if (!supportsShardCounts(original_count, recovery_count))
+            return Error.InvalidArgs;
 
         const shard_len_64 = (shard_bytes + 63) / 64; // round up to 64-byte chunks
         const total = nextPow2(original_count + recovery_count);
@@ -227,8 +239,8 @@ pub const Decoder = struct {
             return Error.InvalidArgs;
         if (shard_bytes % 2 != 0)
             return Error.ShardSizeNotEven;
-        if (original_count >= GF_ORDER or recovery_count >= GF_ORDER)
-            return Error.TooManyOriginal;
+        if (!supportsShardCounts(original_count, recovery_count))
+            return Error.InvalidArgs;
 
         const shard_len_64 = (shard_bytes + 63) / 64;
 
@@ -287,6 +299,7 @@ pub const Decoder = struct {
         if (index >= self.original_count) return Error.InvalidArgs;
         if (data.len != self.shard_bytes) return Error.ShardSizeMismatch;
         const pos = self.original_base + index;
+        if (self.received[pos]) return Error.InvalidArgs;
         self.shards.insert(pos, data);
         self.received[pos] = true;
         self.original_recv_count += 1;
@@ -296,6 +309,7 @@ pub const Decoder = struct {
         if (index >= self.recovery_count) return Error.InvalidArgs;
         if (data.len != self.shard_bytes) return Error.ShardSizeMismatch;
         const pos = self.recovery_base + index;
+        if (self.received[pos]) return Error.InvalidArgs;
         self.shards.insert(pos, data);
         self.received[pos] = true;
         self.recovery_recv_count += 1;
@@ -312,7 +326,10 @@ pub const Decoder = struct {
         for (0..self.original_count) |i| {
             if (!self.received[self.original_base + i]) missing += 1;
         }
-        if (missing == 0) return 0;
+        if (missing == 0) {
+            self.resetState();
+            return 0;
+        }
 
         if (self.high_rate) {
             self.decodeHighRate();
@@ -331,7 +348,14 @@ pub const Decoder = struct {
             }
         }
 
+        self.resetState();
         return count;
+    }
+
+    fn resetState(self: *Decoder) void {
+        @memset(self.received, false);
+        self.original_recv_count = 0;
+        self.recovery_recv_count = 0;
     }
 
     fn decodeHighRate(self: *Decoder) void {
@@ -585,6 +609,100 @@ test "Full encode → decode round-trip (low rate: 2 original, 3 recovery)" {
         const restored = restored_buf[i * shard_bytes ..][0..shard_bytes];
         try testing.expectEqualSlices(u8, &originals[idx], restored);
     }
+}
+
+test "Encoder can be reused with non-64-byte shards" {
+    const original_count = 2;
+    const recovery_count = 3;
+    const shard_bytes = 66;
+
+    const originals = [original_count][shard_bytes]u8{
+        .{0x11} ** shard_bytes,
+        .{0x22} ** shard_bytes,
+    };
+
+    var enc = try Encoder.init(testing.allocator, original_count, recovery_count, shard_bytes);
+    defer enc.deinit();
+
+    var first: [recovery_count * shard_bytes]u8 = undefined;
+    var second: [recovery_count * shard_bytes]u8 = undefined;
+
+    for (&originals) |*s| try enc.addOriginal(s);
+    try enc.encode(&first);
+
+    for (&originals) |*s| try enc.addOriginal(s);
+    try enc.encode(&second);
+
+    try testing.expectEqualSlices(u8, &first, &second);
+}
+
+test "Decoder can be reused after successful decode" {
+    const original_count = 2;
+    const recovery_count = 3;
+    const shard_bytes = 66;
+
+    const originals_a = [original_count][shard_bytes]u8{
+        .{0x31} ** shard_bytes,
+        .{0x42} ** shard_bytes,
+    };
+    const originals_b = [original_count][shard_bytes]u8{
+        .{0x51} ** shard_bytes,
+        .{0x62} ** shard_bytes,
+    };
+
+    var enc = try Encoder.init(testing.allocator, original_count, recovery_count, shard_bytes);
+    defer enc.deinit();
+
+    var dec = try Decoder.init(testing.allocator, original_count, recovery_count, shard_bytes);
+    defer dec.deinit();
+
+    var recovery_a: [recovery_count * shard_bytes]u8 = undefined;
+    for (&originals_a) |*s| try enc.addOriginal(s);
+    try enc.encode(&recovery_a);
+
+    try dec.addRecovery(0, recovery_a[0..shard_bytes]);
+    try dec.addRecovery(1, recovery_a[shard_bytes .. 2 * shard_bytes]);
+
+    var restored_a: [original_count * shard_bytes]u8 = undefined;
+    var indices_a: [original_count]usize = undefined;
+    const restored_count_a = try dec.decode(&restored_a, &indices_a);
+    try testing.expectEqual(@as(usize, 2), restored_count_a);
+    for (0..restored_count_a) |i| {
+        const idx = indices_a[i];
+        const restored = restored_a[i * shard_bytes ..][0..shard_bytes];
+        try testing.expectEqualSlices(u8, &originals_a[idx], restored);
+    }
+
+    var recovery_b: [recovery_count * shard_bytes]u8 = undefined;
+    for (&originals_b) |*s| try enc.addOriginal(s);
+    try enc.encode(&recovery_b);
+
+    try dec.addRecovery(0, recovery_b[0..shard_bytes]);
+    try dec.addRecovery(2, recovery_b[2 * shard_bytes .. 3 * shard_bytes]);
+
+    var restored_b: [original_count * shard_bytes]u8 = undefined;
+    var indices_b: [original_count]usize = undefined;
+    const restored_count_b = try dec.decode(&restored_b, &indices_b);
+    try testing.expectEqual(@as(usize, 2), restored_count_b);
+    for (0..restored_count_b) |i| {
+        const idx = indices_b[i];
+        const restored = restored_b[i * shard_bytes ..][0..shard_bytes];
+        try testing.expectEqualSlices(u8, &originals_b[idx], restored);
+    }
+}
+
+test "Unsupported shard-count combinations are rejected" {
+    try testing.expectError(Error.InvalidArgs, Encoder.init(testing.allocator, 4096, 61441, 64));
+    try testing.expectError(Error.InvalidArgs, Decoder.init(testing.allocator, 61441, 4096, 64));
+}
+
+test "Decoder rejects duplicate shard indexes" {
+    var dec = try Decoder.init(testing.allocator, 2, 3, 64);
+    defer dec.deinit();
+
+    const shard = [_]u8{0xaa} ** 64;
+    try dec.addRecovery(0, &shard);
+    try testing.expectError(Error.InvalidArgs, dec.addRecovery(0, &shard));
 }
 
 test "nextPow2" {

@@ -38,7 +38,9 @@ pub const Shards = struct {
         return .{ .shard_count = shard_count, .shard_len = shard_len, .data = data, .allocator = allocator };
     }
 
-    pub fn deinit(self: *Shards) void { self.allocator.free(self.data); }
+    pub fn deinit(self: *Shards) void {
+        self.allocator.free(self.data);
+    }
 
     pub fn shard(self: *const Shards, index: usize) []const Chunk {
         const s = index * self.shard_len;
@@ -56,9 +58,10 @@ pub const Shards = struct {
         const dst = self.shardMut(index);
         for (0..whole) |i| dst[i] = shard_data[i * 64 ..][0..64].*;
         if (tail > 0) {
+            dst[whole] = .{0} ** 64;
             const half = tail / 2;
             @memcpy(dst[whole][0..half], shard_data[whole * 64 ..][0..half]);
-            @memcpy(dst[whole][32 .. 32 + half], shard_data[whole * 64 + half ..][0..tail - half]);
+            @memcpy(dst[whole][32 .. 32 + half], shard_data[whole * 64 + half ..][0 .. tail - half]);
         }
     }
 
@@ -137,10 +140,14 @@ inline fn storeChunk(c: *Chunk, v0: V16, v1: V16, v2: V16, v3: V16) void {
 }
 
 inline fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
-    const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
-    const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
-    const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
-    const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
+    const lo0: V16 = lut.lo[0];
+    const lo1: V16 = lut.lo[1];
+    const lo2: V16 = lut.lo[2];
+    const lo3: V16 = lut.lo[3];
+    const hi0: V16 = lut.hi[0];
+    const hi1: V16 = lut.hi[1];
+    const hi2: V16 = lut.hi[2];
+    const hi3: V16 = lut.hi[3];
 
     for (x, y) |*xc, yc| {
         const pl, const ph = simdMul16(yc[0..16].*, yc[32..48].*, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
@@ -153,10 +160,14 @@ inline fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
 }
 
 inline fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
-    const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
-    const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
-    const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
-    const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
+    const lo0: V16 = lut.lo[0];
+    const lo1: V16 = lut.lo[1];
+    const lo2: V16 = lut.lo[2];
+    const lo3: V16 = lut.lo[3];
+    const hi0: V16 = lut.hi[0];
+    const hi1: V16 = lut.hi[1];
+    const hi2: V16 = lut.hi[2];
+    const hi3: V16 = lut.hi[3];
 
     for (x) |*c| {
         c[0..16].*, c[32..48].* = simdMul16(c[0..16].*, c[32..48].*, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
@@ -166,10 +177,14 @@ inline fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
 
 /// Fused FFT butterfly: a ^= b * lut; b ^= a (single pass)
 inline fn fftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
-    const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
-    const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
-    const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
-    const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
+    const lo0: V16 = lut.lo[0];
+    const lo1: V16 = lut.lo[1];
+    const lo2: V16 = lut.lo[2];
+    const lo3: V16 = lut.lo[3];
+    const hi0: V16 = lut.hi[0];
+    const hi1: V16 = lut.hi[1];
+    const hi2: V16 = lut.hi[2];
+    const hi3: V16 = lut.hi[3];
 
     for (a, b) |*ac, *bc| {
         // Load both chunks (4 × V16 each → ldp candidates)
@@ -194,10 +209,14 @@ inline fn fftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
 
 /// Fused IFFT butterfly: b ^= a; a ^= b * lut (single pass)
 inline fn ifftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
-    const lo0: V16 = lut.lo[0]; const lo1: V16 = lut.lo[1];
-    const lo2: V16 = lut.lo[2]; const lo3: V16 = lut.lo[3];
-    const hi0: V16 = lut.hi[0]; const hi1: V16 = lut.hi[1];
-    const hi2: V16 = lut.hi[2]; const hi3: V16 = lut.hi[3];
+    const lo0: V16 = lut.lo[0];
+    const lo1: V16 = lut.lo[1];
+    const lo2: V16 = lut.lo[2];
+    const lo3: V16 = lut.lo[3];
+    const hi0: V16 = lut.hi[0];
+    const hi1: V16 = lut.hi[1];
+    const hi2: V16 = lut.hi[2];
+    const hi3: V16 = lut.hi[3];
 
     for (a, b) |*ac, *bc| {
         const a0, const a1, const a2, const a3 = loadChunk(ac);
@@ -220,25 +239,47 @@ inline fn ifftButterfly(a: []Chunk, b: []Chunk, lut: *const gf.Mul128) void {
 
 // ── Engine ─────────────────────────────────────────────────────────────
 
-pub const Engine = struct {
-    el: tables.ExpLog,
+const SharedTables = struct {
     skew: tables.Skew,
-    log_walsh: tables.LogWalsh, // cached — avoids recomputing on every decode
-    mul128: *[GF_ORDER]gf.Mul128,
-    allocator: Allocator,
+    log_walsh: tables.LogWalsh,
+    mul128: [GF_ORDER]gf.Mul128,
+};
+
+var shared_tables: SharedTables = undefined;
+var shared_tables_once = std.once(initSharedTables);
+
+fn initSharedTables() void {
+    const el = tables.initExpLog();
+    shared_tables.skew = tables.initSkew(&el);
+    shared_tables.log_walsh = tables.initLogWalsh(&el);
+    for (0..GF_ORDER) |log_m| {
+        shared_tables.mul128[log_m] = tables.buildMul128Entry(@intCast(log_m), &el);
+    }
+}
+
+fn getSharedTables() *const SharedTables {
+    shared_tables_once.call();
+    return &shared_tables;
+}
+
+pub const Engine = struct {
+    skew: *const tables.Skew,
+    log_walsh: *const tables.LogWalsh,
+    mul128: *const [GF_ORDER]gf.Mul128,
 
     pub fn init(allocator: Allocator) !Engine {
-        const el = tables.initExpLog();
-        const skew = tables.initSkew(&el);
-        const log_walsh = tables.initLogWalsh(&el);
-        const mul128 = try allocator.create([GF_ORDER]gf.Mul128);
-        for (0..GF_ORDER) |log_m| {
-            mul128[log_m] = tables.buildMul128Entry(@intCast(log_m), &el);
-        }
-        return .{ .el = el, .skew = skew, .log_walsh = log_walsh, .mul128 = mul128, .allocator = allocator };
+        _ = allocator;
+        const shared = getSharedTables();
+        return .{
+            .skew = &shared.skew,
+            .log_walsh = &shared.log_walsh,
+            .mul128 = &shared.mul128,
+        };
     }
 
-    pub fn deinit(self: *Engine) void { self.allocator.destroy(self.mul128); }
+    pub fn deinit(self: *Engine) void {
+        _ = self;
+    }
 
     pub fn fft(self: *const Engine, shards: *Shards, pos: usize, size: usize, truncated_size: usize, skew_delta: usize) void {
         const sl = shards.shard_len;
@@ -337,7 +378,9 @@ test "FFT then IFFT round-trip" {
     var shards = try Shards.init(alloc, count, 1);
     defer shards.deinit();
     for (0..count) |i| {
-        for (shards.shardMut(i)) |*chunk| for (chunk) |*b| { b.* = @truncate(i * 17 + 3); };
+        for (shards.shardMut(i)) |*chunk| for (chunk) |*b| {
+            b.* = @truncate(i * 17 + 3);
+        };
     }
     const original = try alloc.alloc(Chunk, count);
     defer alloc.free(original);
