@@ -149,14 +149,16 @@ pub inline fn tblLookup(table: @Vector(16, u8), indices: @Vector(16, u8)) @Vecto
               [idx] "w" (indices),
         );
     } else if (comptime (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86)) {
-        // SSSE3 pshufb — copy table to output register first, then shuffle in-place
-        return asm (
-            \\movdqa %[tbl], %[out]
-            \\pshufb %[idx], %[out]
-            : [out] "=&x" (-> @Vector(16, u8)),
-            : [tbl] "x" (table),
-              [idx] "x" (indices),
-        );
+        // x86 hot path uses AVX2 C FFI (simd_x86.c) for the engine layer.
+        // This scalar fallback is only used for tests and non-hot-path code.
+        // Zig's x86 inline asm encoder has bugs with pshufb in inlined contexts.
+        var result: [16]u8 = undefined;
+        const t: [16]u8 = table;
+        const idx: [16]u8 = indices;
+        inline for (0..16) |i| {
+            result[i] = t[idx[i] & 0x0f];
+        }
+        return result;
     } else {
         var result: [16]u8 = undefined;
         const t: [16]u8 = table;
