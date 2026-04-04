@@ -1,7 +1,7 @@
 //! Lookup tables for Leopard-RS: Skew factors for FFT/IFFT, LogWalsh for decoding.
 //!
 //! Tables are initialized at runtime (too large for comptime with Zig's branch quota limits
-//! for the skew table's nested loops). Uses lazy initialization via a simple flag.
+//! for the skew table's nested loops). The engine builds them once via `std.once`.
 
 const std = @import("std");
 const gf = @import("gf.zig");

@@ -1,0 +1,16 @@
+[package]
+name = "readme-rustdocifier"
+version = "0.1.1"
+license = "MIT"
+description = "A library for rustdocifying `README.md` for inclusion in `lib.rs`"
+repository = "https://github.com/malaire/readme-rustdocifier"
+keywords = [ "build", "build-dependencies", "documentation", "readme" ]
+categories = [ "development-tools::build-utils" ]
+edition = "2021"
+
+include = [
+    "/src",
+    "LICENSE",
+    "README.md",
+    "build.rs",
+]

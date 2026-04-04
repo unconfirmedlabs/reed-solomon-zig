@@ -38,6 +38,22 @@ fn nextPow2Multiple(n: usize, chunk_size: usize) usize {
     return ((n + chunk_size - 1) / chunk_size) * chunk_size;
 }
 
+fn shardLen64(shard_bytes: usize) Error!usize {
+    if (shard_bytes == 0) return Error.InvalidArgs;
+    if (shard_bytes % 2 != 0) return Error.ShardSizeNotEven;
+
+    const padded = std.math.add(usize, shard_bytes, 63) catch return Error.InvalidArgs;
+    return padded / 64;
+}
+
+fn checkedByteCount(count: usize, shard_bytes: usize) Error!usize {
+    return std.math.mul(usize, count, shard_bytes) catch return Error.InvalidArgs;
+}
+
+fn ensureShardStorageFits(shard_count: usize, shard_len_64: usize) Error!void {
+    _ = std.math.mul(usize, shard_count, shard_len_64) catch return Error.InvalidArgs;
+}
+
 // ── Public helpers ─────────────────────────────────────────────────────
 
 /// Returns true if the given shard counts are supported.
@@ -49,7 +65,7 @@ pub fn supports(original_count: usize, recovery_count: usize) bool {
 pub fn serializedSize(original_count: usize, recovery_count: usize, shard_bytes: usize) ?usize {
     if (!supportsShardCounts(original_count, recovery_count)) return null;
     if (shard_bytes == 0 or shard_bytes % 2 != 0) return null;
-    return recovery_count * shard_bytes;
+    return std.math.mul(usize, recovery_count, shard_bytes) catch null;
 }
 
 /// Encode in one call. Allocates encoder internally.
@@ -83,6 +99,9 @@ pub fn decode(
     restored_out: []u8,
     restored_indices: []usize,
 ) Error!usize {
+    if (original_indices.len != original_shards.len) return Error.InvalidArgs;
+    if (recovery_indices.len != recovery_shards.len) return Error.InvalidArgs;
+
     var dec = try Decoder.init(allocator, original_count, recovery_count, shard_bytes);
     defer dec.deinit();
     for (original_indices, original_shards) |idx, shard| try dec.addOriginal(idx, shard);
@@ -117,6 +136,19 @@ fn supportsShardCounts(original_count: usize, recovery_count: usize) bool {
     return smaller_pow2 <= GF_ORDER - larger;
 }
 
+/// Matches the upstream `reed-solomon-simd` default rate-selection heuristic.
+fn useHighRate(original_count: usize, recovery_count: usize) bool {
+    const o_pow2 = nextPow2(original_count);
+    const r_pow2 = nextPow2(recovery_count);
+
+    if (o_pow2 < r_pow2) return false;
+    if (o_pow2 > r_pow2) return true;
+
+    // Equal power-of-two buckets intentionally prefer the "wrong" rate when
+    // it is typically faster for skewed shard-count ratios.
+    return original_count <= recovery_count;
+}
+
 // ── Encoder ────────────────────────────────────────────────────────────
 
 pub const Encoder = struct {
@@ -130,15 +162,14 @@ pub const Encoder = struct {
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, original_count: usize, recovery_count: usize, shard_bytes: usize) Error!Encoder {
-        if (original_count == 0 or recovery_count == 0 or shard_bytes == 0)
+        if (original_count == 0 or recovery_count == 0)
             return Error.InvalidArgs;
-        if (shard_bytes % 2 != 0)
-            return Error.ShardSizeNotEven;
         if (!supportsShardCounts(original_count, recovery_count))
             return Error.InvalidArgs;
 
-        const shard_len_64 = (shard_bytes + 63) / 64; // round up to 64-byte chunks
+        const shard_len_64 = try shardLen64(shard_bytes);
         const total = nextPow2(original_count + recovery_count);
+        try ensureShardStorageFits(total, shard_len_64);
 
         var shards = Shards.init(allocator, total, shard_len_64) catch return Error.OutOfMemory;
         errdefer shards.deinit();
@@ -164,18 +195,20 @@ pub const Encoder = struct {
 
     /// Reset the encoder to a new configuration, reusing the engine's shared tables.
     pub fn reset(self: *Encoder, original_count: usize, recovery_count: usize, shard_bytes: usize) Error!void {
-        if (original_count == 0 or recovery_count == 0 or shard_bytes == 0)
+        if (original_count == 0 or recovery_count == 0)
             return Error.InvalidArgs;
-        if (shard_bytes % 2 != 0)
-            return Error.ShardSizeNotEven;
         if (!supportsShardCounts(original_count, recovery_count))
             return Error.InvalidArgs;
 
-        const shard_len_64 = (shard_bytes + 63) / 64;
+        const shard_len_64 = try shardLen64(shard_bytes);
         const total = nextPow2(original_count + recovery_count);
+        try ensureShardStorageFits(total, shard_len_64);
 
-        self.shards.deinit();
-        self.shards = Shards.init(self.allocator, total, shard_len_64) catch return Error.OutOfMemory;
+        const new_shards = Shards.init(self.allocator, total, shard_len_64) catch return Error.OutOfMemory;
+        var old_shards = self.shards;
+        self.shards = new_shards;
+        old_shards.deinit();
+
         self.original_count = original_count;
         self.recovery_count = recovery_count;
         self.shard_bytes = shard_bytes;
@@ -194,16 +227,15 @@ pub const Encoder = struct {
     /// Encode recovery shards. Returns recovery data in the output buffer.
     /// `out` must be at least `recovery_count * shard_bytes` bytes.
     pub fn encode(self: *Encoder, out: []u8) Error!void {
+        const recovery_bytes = try checkedByteCount(self.recovery_count, self.shard_bytes);
+
         if (self.added != self.original_count) return Error.TooFewShards;
-        if (out.len < self.recovery_count * self.shard_bytes) return Error.InvalidArgs;
+        if (out.len < recovery_bytes) return Error.InvalidArgs;
 
-        const k = self.original_count;
-
-        // Determine if high-rate or low-rate
-        if (k >= self.recovery_count) {
-            self.encodeHighRate(k);
+        if (useHighRate(self.original_count, self.recovery_count)) {
+            self.encodeHighRate(self.original_count);
         } else {
-            self.encodeLowRate(k);
+            self.encodeLowRate(self.original_count);
         }
 
         // Extract recovery shards to output buffer
@@ -305,14 +337,12 @@ pub const Decoder = struct {
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, original_count: usize, recovery_count: usize, shard_bytes: usize) Error!Decoder {
-        if (original_count == 0 or recovery_count == 0 or shard_bytes == 0)
+        if (original_count == 0 or recovery_count == 0)
             return Error.InvalidArgs;
-        if (shard_bytes % 2 != 0)
-            return Error.ShardSizeNotEven;
         if (!supportsShardCounts(original_count, recovery_count))
             return Error.InvalidArgs;
 
-        const shard_len_64 = (shard_bytes + 63) / 64;
+        const shard_len_64 = try shardLen64(shard_bytes);
 
         // Determine rate and layout (matching Rust's use_high_rate logic)
         const high_rate = useHighRate(original_count, recovery_count);
@@ -332,6 +362,7 @@ pub const Decoder = struct {
             recovery_base = chunk_size;
             work_count = nextPow2(chunk_size + recovery_count);
         }
+        try ensureShardStorageFits(work_count, shard_len_64);
 
         var shards = Shards.init(allocator, work_count, shard_len_64) catch return Error.OutOfMemory;
         errdefer shards.deinit();
@@ -367,14 +398,12 @@ pub const Decoder = struct {
 
     /// Reset the decoder to a new configuration, reusing the engine's shared tables.
     pub fn reset(self: *Decoder, original_count: usize, recovery_count: usize, shard_bytes: usize) Error!void {
-        if (original_count == 0 or recovery_count == 0 or shard_bytes == 0)
+        if (original_count == 0 or recovery_count == 0)
             return Error.InvalidArgs;
-        if (shard_bytes % 2 != 0)
-            return Error.ShardSizeNotEven;
         if (!supportsShardCounts(original_count, recovery_count))
             return Error.InvalidArgs;
 
-        const shard_len_64 = (shard_bytes + 63) / 64;
+        const shard_len_64 = try shardLen64(shard_bytes);
         const high_rate = useHighRate(original_count, recovery_count);
 
         var original_base: usize = undefined;
@@ -392,13 +421,23 @@ pub const Decoder = struct {
             recovery_base = chunk_size;
             work_count = nextPow2(chunk_size + recovery_count);
         }
+        try ensureShardStorageFits(work_count, shard_len_64);
 
-        self.shards.deinit();
-        self.allocator.free(self.received);
+        var new_shards = Shards.init(self.allocator, work_count, shard_len_64) catch return Error.OutOfMemory;
+        errdefer new_shards.deinit();
 
-        self.shards = Shards.init(self.allocator, work_count, shard_len_64) catch return Error.OutOfMemory;
-        self.received = self.allocator.alloc(bool, work_count) catch return Error.OutOfMemory;
-        @memset(self.received, false);
+        const new_received = self.allocator.alloc(bool, work_count) catch return Error.OutOfMemory;
+        errdefer self.allocator.free(new_received);
+        @memset(new_received, false);
+
+        var old_shards = self.shards;
+        const old_received = self.received;
+
+        self.shards = new_shards;
+        self.received = new_received;
+
+        old_shards.deinit();
+        self.allocator.free(old_received);
 
         self.original_count = original_count;
         self.recovery_count = recovery_count;
@@ -437,7 +476,9 @@ pub const Decoder = struct {
     /// `restored_out` must be at least `original_count * shard_bytes` bytes.
     /// `restored_indices` must be at least `original_count` entries.
     pub fn decode(self: *Decoder, restored_out: []u8, restored_indices: []usize) Error!usize {
-        if (restored_out.len < self.original_count * self.shard_bytes)
+        const original_bytes = try checkedByteCount(self.original_count, self.shard_bytes);
+
+        if (restored_out.len < original_bytes)
             return Error.InvalidArgs;
         if (restored_indices.len < self.original_count)
             return Error.InvalidArgs;
@@ -586,20 +627,255 @@ pub const Decoder = struct {
             }
         }
     }
-
-    fn useHighRate(original_count: usize, recovery_count: usize) bool {
-        const o_pow2 = nextPow2(original_count);
-        const r_pow2 = nextPow2(recovery_count);
-        if (o_pow2 < r_pow2) return false;
-        if (o_pow2 > r_pow2) return true;
-        // Equal power-of-two: use "wrong" rate (counter-intuitive optimization)
-        return original_count <= recovery_count;
-    }
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+const RandomizedConfig = struct {
+    original_count: usize,
+    recovery_count: usize,
+    shard_bytes: usize,
+};
+
+fn shuffleIndices(random: std.Random, indices: []usize) void {
+    if (indices.len <= 1) return;
+
+    var i = indices.len;
+    while (i > 1) {
+        i -= 1;
+        const j = random.uintLessThan(usize, i + 1);
+        std.mem.swap(usize, &indices[i], &indices[j]);
+    }
+}
+
+fn randomSupportedConfig(random: std.Random) RandomizedConfig {
+    const shard_byte_options = [_]usize{ 2, 4, 6, 62, 64, 66, 96, 128, 254, 256, 510, 512, 1024, 4100 };
+
+    while (true) {
+        const original_count = random.uintLessThan(usize, 32) + 1;
+        const recovery_count = random.uintLessThan(usize, 32) + 1;
+        if (!supports(original_count, recovery_count)) continue;
+
+        return .{
+            .original_count = original_count,
+            .recovery_count = recovery_count,
+            .shard_bytes = shard_byte_options[random.uintLessThan(usize, shard_byte_options.len)],
+        };
+    }
+}
+
+fn allocRandomOriginals(allocator: Allocator, random: std.Random, original_count: usize, shard_bytes: usize) ![][]u8 {
+    const originals = try allocator.alloc([]u8, original_count);
+    errdefer allocator.free(originals);
+
+    var allocated: usize = 0;
+    errdefer {
+        for (originals[0..allocated]) |shard| allocator.free(shard);
+    }
+
+    for (0..original_count) |i| {
+        originals[i] = try allocator.alloc(u8, shard_bytes);
+        allocated += 1;
+        random.bytes(originals[i]);
+    }
+
+    return originals;
+}
+
+fn freeOriginals(allocator: Allocator, originals: [][]u8) void {
+    for (originals) |shard| allocator.free(shard);
+    allocator.free(originals);
+}
+
+fn countMissing(missing_flags: []const bool) usize {
+    var count: usize = 0;
+    for (missing_flags) |is_missing| {
+        if (is_missing) count += 1;
+    }
+    return count;
+}
+
+fn verifyRestored(
+    originals: [][]u8,
+    missing_flags: []const bool,
+    restored_count: usize,
+    restored_out: []const u8,
+    restored_indices: []const usize,
+    shard_bytes: usize,
+) !void {
+    try testing.expectEqual(countMissing(missing_flags), restored_count);
+
+    var seen_missing: usize = 0;
+    var restored_seen: [32]bool = .{false} ** 32;
+
+    for (0..restored_count) |i| {
+        const idx = restored_indices[i];
+        try testing.expect(idx < originals.len);
+        try testing.expect(missing_flags[idx]);
+        try testing.expect(!restored_seen[idx]);
+
+        restored_seen[idx] = true;
+        seen_missing += 1;
+
+        const restored = restored_out[i * shard_bytes ..][0..shard_bytes];
+        try testing.expectEqualSlices(u8, originals[idx], restored);
+    }
+
+    try testing.expectEqual(countMissing(missing_flags), seen_missing);
+}
+
+fn chooseDecodePattern(
+    random: std.Random,
+    original_count: usize,
+    recovery_count: usize,
+    missing_flags: *[32]bool,
+    original_order: *[32]usize,
+    recovery_order: *[32]usize,
+) struct { missing_count: usize, recovery_used: usize } {
+    @memset(missing_flags, false);
+
+    for (0..original_count) |i| original_order[i] = i;
+    for (0..recovery_count) |i| recovery_order[i] = i;
+
+    shuffleIndices(random, original_order[0..original_count]);
+    shuffleIndices(random, recovery_order[0..recovery_count]);
+
+    const max_missing = @min(original_count, recovery_count);
+    const missing_count = random.uintLessThan(usize, max_missing + 1);
+    for (original_order[0..missing_count]) |idx| missing_flags[idx] = true;
+
+    const recovery_used = missing_count + random.uintLessThan(usize, recovery_count - missing_count + 1);
+    return .{ .missing_count = missing_count, .recovery_used = recovery_used };
+}
+
+fn runRandomRoundTripCase(allocator: Allocator, random: std.Random, enc: *Encoder, dec: *Decoder) !void {
+    const cfg = randomSupportedConfig(random);
+
+    try enc.reset(cfg.original_count, cfg.recovery_count, cfg.shard_bytes);
+    try dec.reset(cfg.original_count, cfg.recovery_count, cfg.shard_bytes);
+
+    const originals = try allocRandomOriginals(allocator, random, cfg.original_count, cfg.shard_bytes);
+    defer freeOriginals(allocator, originals);
+
+    const recovery_buf = try allocator.alloc(u8, try checkedByteCount(cfg.recovery_count, cfg.shard_bytes));
+    defer allocator.free(recovery_buf);
+
+    for (originals) |shard| try enc.addOriginal(shard);
+    try enc.encode(recovery_buf);
+
+    var missing_flags: [32]bool = .{false} ** 32;
+    var original_order: [32]usize = undefined;
+    var recovery_order: [32]usize = undefined;
+    const pattern = chooseDecodePattern(
+        random,
+        cfg.original_count,
+        cfg.recovery_count,
+        &missing_flags,
+        &original_order,
+        &recovery_order,
+    );
+
+    for (original_order[0..cfg.original_count]) |idx| {
+        if (!missing_flags[idx]) try dec.addOriginal(idx, originals[idx]);
+    }
+    for (recovery_order[0..pattern.recovery_used]) |idx| {
+        const start = idx * cfg.shard_bytes;
+        try dec.addRecovery(idx, recovery_buf[start .. start + cfg.shard_bytes]);
+    }
+
+    const restored_out = try allocator.alloc(u8, try checkedByteCount(cfg.original_count, cfg.shard_bytes));
+    defer allocator.free(restored_out);
+    const restored_indices = try allocator.alloc(usize, cfg.original_count);
+    defer allocator.free(restored_indices);
+
+    const restored_count = try dec.decode(restored_out, restored_indices);
+    try testing.expectEqual(pattern.missing_count, restored_count);
+    try verifyRestored(
+        originals,
+        missing_flags[0..cfg.original_count],
+        restored_count,
+        restored_out,
+        restored_indices,
+        cfg.shard_bytes,
+    );
+}
+
+fn runRandomWrapperRoundTripCase(allocator: Allocator, random: std.Random) !void {
+    const cfg = randomSupportedConfig(random);
+    const originals = try allocRandomOriginals(allocator, random, cfg.original_count, cfg.shard_bytes);
+    defer freeOriginals(allocator, originals);
+
+    const recovery_buf = try allocator.alloc(u8, try checkedByteCount(cfg.recovery_count, cfg.shard_bytes));
+    defer allocator.free(recovery_buf);
+    try encode(allocator, cfg.original_count, cfg.recovery_count, cfg.shard_bytes, originals, recovery_buf);
+
+    var missing_flags: [32]bool = .{false} ** 32;
+    var original_order: [32]usize = undefined;
+    var recovery_order: [32]usize = undefined;
+    const pattern = chooseDecodePattern(
+        random,
+        cfg.original_count,
+        cfg.recovery_count,
+        &missing_flags,
+        &original_order,
+        &recovery_order,
+    );
+
+    const survivor_count = cfg.original_count - pattern.missing_count;
+    const original_indices = try allocator.alloc(usize, survivor_count);
+    defer allocator.free(original_indices);
+    const original_shards = try allocator.alloc([]const u8, survivor_count);
+    defer allocator.free(original_shards);
+
+    var survivor_idx: usize = 0;
+    for (original_order[0..cfg.original_count]) |idx| {
+        if (missing_flags[idx]) continue;
+        original_indices[survivor_idx] = idx;
+        original_shards[survivor_idx] = originals[idx];
+        survivor_idx += 1;
+    }
+
+    const recovery_indices = try allocator.alloc(usize, pattern.recovery_used);
+    defer allocator.free(recovery_indices);
+    const recovery_shards = try allocator.alloc([]const u8, pattern.recovery_used);
+    defer allocator.free(recovery_shards);
+
+    for (recovery_order[0..pattern.recovery_used], 0..) |idx, i| {
+        recovery_indices[i] = idx;
+        const start = idx * cfg.shard_bytes;
+        recovery_shards[i] = recovery_buf[start .. start + cfg.shard_bytes];
+    }
+
+    const restored_out = try allocator.alloc(u8, try checkedByteCount(cfg.original_count, cfg.shard_bytes));
+    defer allocator.free(restored_out);
+    const restored_indices = try allocator.alloc(usize, cfg.original_count);
+    defer allocator.free(restored_indices);
+
+    const restored_count = try decode(
+        allocator,
+        cfg.original_count,
+        cfg.recovery_count,
+        cfg.shard_bytes,
+        original_indices,
+        original_shards,
+        recovery_indices,
+        recovery_shards,
+        restored_out,
+        restored_indices,
+    );
+
+    try testing.expectEqual(pattern.missing_count, restored_count);
+    try verifyRestored(
+        originals,
+        missing_flags[0..cfg.original_count],
+        restored_count,
+        restored_out,
+        restored_indices,
+        cfg.shard_bytes,
+    );
+}
 
 test "Encoder init and deinit" {
     var enc = try Encoder.init(testing.allocator, 3, 2, 64);
@@ -799,7 +1075,35 @@ test "Decoder can be reused after successful decode" {
     }
 }
 
+test "randomized round-trips across encoder and decoder resets" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_1234_89ab_cdef);
+    const random = prng.random();
+
+    var enc = try Encoder.init(testing.allocator, 1, 1, 2);
+    defer enc.deinit();
+    var dec = try Decoder.init(testing.allocator, 1, 1, 2);
+    defer dec.deinit();
+
+    for (0..200) |_| {
+        try runRandomRoundTripCase(testing.allocator, random, &enc, &dec);
+    }
+}
+
+test "randomized one-shot encode/decode wrappers round-trip" {
+    var prng = std.Random.DefaultPrng.init(0x1234_5678_dead_beef);
+    const random = prng.random();
+
+    for (0..120) |_| {
+        try runRandomWrapperRoundTripCase(testing.allocator, random);
+    }
+}
+
 test "Unsupported shard-count combinations are rejected" {
+    try testing.expect(supports(4096, 61440));
+    try testing.expect(supports(61440, 4096));
+    try testing.expect(!supports(4096, 61441));
+    try testing.expect(!supports(61441, 4096));
+
     try testing.expectError(Error.InvalidArgs, Encoder.init(testing.allocator, 4096, 61441, 64));
     try testing.expectError(Error.InvalidArgs, Decoder.init(testing.allocator, 61441, 4096, 64));
 }
@@ -821,4 +1125,91 @@ test "nextPow2" {
     try testing.expectEqual(@as(usize, 8), nextPow2(5));
     try testing.expectEqual(@as(usize, 16), nextPow2(16));
     try testing.expectEqual(@as(usize, 32), nextPow2(17));
+}
+
+test "serializedSize rejects overflow" {
+    const huge = std.math.maxInt(usize) - 1;
+    try testing.expectEqual(@as(?usize, null), serializedSize(1, 2, huge));
+}
+
+test "oversized shard sizes are rejected before allocation" {
+    const huge = std.math.maxInt(usize) - 1;
+    try testing.expectError(Error.InvalidArgs, Encoder.init(testing.allocator, 1, 1, huge));
+    try testing.expectError(Error.InvalidArgs, Decoder.init(testing.allocator, 1, 1, huge));
+}
+
+test "useHighRate matches upstream heuristic examples" {
+    try testing.expect(useHighRate(3, 2));
+    try testing.expect(!useHighRate(2, 3));
+    try testing.expect(useHighRate(5, 8));
+    try testing.expect(!useHighRate(8, 5));
+    try testing.expect(useHighRate(9, 16));
+    try testing.expect(!useHighRate(16, 9));
+}
+
+test "decode wrapper rejects mismatched paired input slices" {
+    var restored_out: [2]u8 = undefined;
+    var restored_indices: [1]usize = undefined;
+    const shard = [_]u8{ 0xaa, 0xbb };
+
+    try testing.expectError(Error.InvalidArgs, decode(
+        testing.allocator,
+        1,
+        1,
+        2,
+        &.{0},
+        &.{},
+        &.{},
+        &.{},
+        &restored_out,
+        &restored_indices,
+    ));
+
+    try testing.expectError(Error.InvalidArgs, decode(
+        testing.allocator,
+        1,
+        1,
+        2,
+        &.{},
+        &.{&shard},
+        &.{},
+        &.{},
+        &restored_out,
+        &restored_indices,
+    ));
+
+    try testing.expectError(Error.InvalidArgs, decode(
+        testing.allocator,
+        1,
+        1,
+        2,
+        &.{},
+        &.{},
+        &.{0},
+        &.{},
+        &restored_out,
+        &restored_indices,
+    ));
+}
+
+fn encoderResetHandlesAllocationFailures(allocator: Allocator) !void {
+    var enc = try Encoder.init(allocator, 3, 2, 64);
+    defer enc.deinit();
+
+    try enc.reset(9, 16, 128);
+}
+
+test "Encoder.reset is allocation-failure safe" {
+    try testing.checkAllAllocationFailures(testing.allocator, encoderResetHandlesAllocationFailures, .{});
+}
+
+fn decoderResetHandlesAllocationFailures(allocator: Allocator) !void {
+    var dec = try Decoder.init(allocator, 2, 3, 64);
+    defer dec.deinit();
+
+    try dec.reset(9, 16, 128);
+}
+
+test "Decoder.reset is allocation-failure safe" {
+    try testing.checkAllAllocationFailures(testing.allocator, decoderResetHandlesAllocationFailures, .{});
 }

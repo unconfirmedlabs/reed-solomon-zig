@@ -1,8 +1,8 @@
 # reed-solomon-zig
 
-Reed-Solomon erasure coding for Zig. Faster than the Rust reference on both ARM and x86.
+Reed-Solomon erasure coding for Zig, compatible with the Leopard-RS / `reed-solomon-simd` format.
 
-Implements Leopard-RS over GF(2^16) with platform-specific SIMD acceleration. Produces byte-identical output to the Rust [`reed-solomon-simd`](https://github.com/AndersTrier/reed-solomon-simd) crate — verified across 26 configurations.
+Implements Leopard-RS over GF(2^16) with platform-specific SIMD acceleration. In local comparison runs it produced byte-identical output to the Rust [`reed-solomon-simd`](https://github.com/AndersTrier/reed-solomon-simd) crate across representative configurations, and the repository includes vendored differential-fuzz and benchmark tooling for reproducing those checks.
 
 ## Usage
 
@@ -30,13 +30,13 @@ const restored_count = try dec.decode(restored_buffer, indices_buffer);
 ### Key properties
 
 - **Shard bytes must be even** (Reed-Solomon over GF(2^16) operates on 16-bit elements)
-- **Max 65536 total shards** (original + recovery)
+- **Supported shard-count combinations match the same GF(2^16) limits used by `reed-solomon-simd`**
 - **Encoder/decoder are reusable** — encode/decode resets internal state automatically
-- **Thread-safe table initialization** — lookup tables computed once per process
+- **Thread-safe shared table initialization** — lookup tables are computed once per process
 
 ## Performance
 
-Byte-identical output with Rust `reed-solomon-simd`, consistently faster across all tested configurations.
+The numbers below are from local runs against `reed-solomon-simd` on the listed machines. The Zig implementation is generally near parity and often modestly faster, but not every configuration is a win.
 
 ### ARM — Apple M5 (AArch64 NEON)
 
@@ -60,12 +60,12 @@ Byte-identical output with Rust `reed-solomon-simd`, consistently faster across 
 
 *Ratio < 1.0 = Zig faster. All configs produce byte-identical output (verified).*
 
-### Why it's fast
+### Implementation notes
 
-- **Fused butterfly** — FFT butterfly combines multiply + XOR in a single pass, keeping data in SIMD registers between operations. Rust does these as separate function calls with an extra memory round-trip.
-- **AVX2 with amortized table broadcast** — On x86, lookup tables are loaded into YMM registers once per butterfly group and applied to all chunks in a tight C loop. No per-chunk function call overhead.
-- **NEON `tbl` inline asm** — On ARM, uses the `tbl` instruction directly for 16-byte table lookups at 30+ GB/s.
-- **Shared global tables** — The 8 MiB Mul128 lookup table is initialized once per process and shared across all encoder/decoder instances.
+- Like the Rust reference, the hot path uses fused butterfly kernels for FFT/IFFT work.
+- On AArch64, the lookup-heavy multiply path uses inline `tbl` instructions.
+- On x86 targets built with AVX2 enabled, the shuffle-heavy hot path lives in a small C helper (`src/simd_x86.c`).
+- Shared lookup tables amortize the one-time initialization cost across encoder/decoder instances.
 
 ## Architecture
 
@@ -73,24 +73,22 @@ Byte-identical output with Rust `reed-solomon-simd`, consistently faster across 
 src/
   reed_solomon.zig   Root module — re-exports Encoder, Decoder
   codec.zig          Encoder/Decoder with high-rate + low-rate paths
-  engine.zig         FFT/IFFT with fused butterfly, shard management
+  engine.zig         FFT/IFFT, butterfly kernels, shard management
   gf.zig             GF(2^16) arithmetic, comptime log/exp tables, SIMD multiply
   fwht.zig           Fast Walsh-Hadamard Transform
   tables.zig         Cantor-basis exp/log, skew table, Mul128 table init
   simd_x86.c         AVX2 intrinsics for x86 (compiled by zig cc)
 ```
 
-~1,900 lines total (1,770 Zig + 90 C). The Rust reference is ~7,600 lines.
-
 ## SIMD support
 
 | Platform | Engine | Instructions |
 |---|---|---|
 | AArch64 (ARM) | Zig inline asm | NEON `tbl` (128-bit) |
-| x86_64 (Intel/AMD) | C FFI (AVX2) | `vpshufb` (256-bit) |
+| x86/x86_64 targets built with AVX2 | C helper | `vpshufb` (256-bit) |
 | Other | Scalar fallback | Element-by-element lookup |
 
-The x86 AVX2 path uses a small C file (`simd_x86.c`) compiled with `-mavx2` by Zig's built-in C compiler. This bypasses a [Zig compiler limitation](https://github.com/ziglang/zig/issues/24810) with inline assembly on x86 vectors. When Zig adds runtime `@shuffle` support, the C file will be replaced with pure Zig.
+The x86 AVX2 path uses a small C file (`simd_x86.c`) compiled with `-mavx2` by Zig's built-in C compiler. This keeps the shuffle-heavy hot path simple and reliable while the rest of the implementation stays in Zig.
 
 ## Install
 
@@ -112,6 +110,28 @@ const rs = b.dependency("reed_solomon", .{ .target = target, .optimize = optimiz
 exe.root_module.addImport("reed_solomon", rs.module("reed_solomon"));
 ```
 
+## Differential fuzzing
+
+The repository includes a vendored Rust reference shim and a Zig differential harness:
+
+```bash
+zig build diff-fuzz -Doptimize=ReleaseFast
+```
+
+Useful knobs:
+
+```bash
+zig build diff-fuzz -Doptimize=ReleaseFast -Ddiff-iters=50000 -Ddiff-seed=1311768467463790320
+```
+
+This target:
+
+- builds `tools/rs-ffi` in locked offline mode
+- links it into `tools/diff_decode_fuzz.zig`
+- compares Zig encode/decode behavior against the vendored Rust `reed-solomon-simd` reference over randomized shard sizes, shard-count pairs, and erasure patterns
+
+Run it with the default host target. It is a runtime validation step, not a cross-compilation target.
+
 ## Reproducing benchmarks
 
 Requires: Zig 0.15+, Rust stable, both on the same machine.
@@ -119,41 +139,7 @@ Requires: Zig 0.15+, Rust stable, both on the same machine.
 ### 1. Build the Rust reference FFI wrapper
 
 ```bash
-mkdir -p /tmp/rs-ffi/src
-cat > /tmp/rs-ffi/Cargo.toml << 'EOF'
-[package]
-name = "rs-ffi"
-version = "0.1.0"
-edition = "2021"
-[lib]
-crate-type = ["staticlib"]
-[dependencies]
-reed-solomon-simd = "3.1"
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
-EOF
-
-cat > /tmp/rs-ffi/src/lib.rs << 'EOF'
-use reed_solomon_simd::ReedSolomonEncoder;
-use std::ptr;
-pub struct Enc { inner: ReedSolomonEncoder, sb: usize }
-#[no_mangle] pub extern "C" fn rs_encoder_new(o: usize, r: usize, s: usize) -> *mut Enc {
-    match ReedSolomonEncoder::new(o, r, s) { Ok(e) => Box::into_raw(Box::new(Enc{inner:e,sb:s})), Err(_) => ptr::null_mut() }
-}
-#[no_mangle] pub extern "C" fn rs_encoder_add_original(e: *mut Enc, d: *const u8, l: usize) -> i32 {
-    let e=unsafe{&mut*e}; match e.inner.add_original_shard(unsafe{std::slice::from_raw_parts(d,l)}) { Ok(())=>0, Err(_)=>-1 }
-}
-#[no_mangle] pub extern "C" fn rs_encoder_encode(e: *mut Enc, out: *mut u8) -> i32 {
-    let e=unsafe{&mut*e}; let r=match e.inner.encode(){Ok(r)=>r,Err(_)=>return -1};
-    let mut off=0; for s in r.recovery_iter(){unsafe{std::ptr::copy_nonoverlapping(s.as_ptr(),out.add(off),e.sb);}off+=e.sb;} 0
-}
-#[no_mangle] pub extern "C" fn rs_encoder_free(e: *mut Enc) { if !e.is_null(){unsafe{drop(Box::from_raw(e));}} }
-EOF
-
-cd /tmp/rs-ffi && cargo build --release
+cargo build --release --locked --offline --manifest-path tools/rs-ffi/Cargo.toml
 ```
 
 ### 2. Build and run the benchmark
@@ -233,14 +219,14 @@ cd reed-solomon-zig
 # On ARM (macOS):
 zig build-exe -OReleaseFast \
   --dep codec -Mroot=bench.zig -Mcodec=src/codec.zig \
-  /tmp/rs-ffi/target/release/librs_ffi.a -lc \
+  tools/rs-ffi/target/release/librs_ffi.a -lc \
   -femit-bin=bench
 
 # On x86 (Linux):
 zig cc -c -mavx2 -mssse3 -O3 src/simd_x86.c -o /tmp/simd_x86.o
 zig build-exe -OReleaseFast \
   --dep codec -Mroot=bench.zig -Mcodec=src/codec.zig \
-  /tmp/simd_x86.o /tmp/rs-ffi/target/release/librs_ffi.a -lc -lunwind \
+  /tmp/simd_x86.o tools/rs-ffi/target/release/librs_ffi.a -lc -lunwind \
   -femit-bin=bench
 
 ./bench

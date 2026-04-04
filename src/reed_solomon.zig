@@ -1,7 +1,7 @@
 //! Reed-Solomon erasure coding for Zig.
 //!
-//! Implements Leopard-RS over GF(2^16) with SIMD acceleration (ARM NEON / scalar fallback).
-//! Byte-identical output with the Rust `reed-solomon-simd` crate.
+//! Implements Leopard-RS over GF(2^16) with platform-specific SIMD acceleration.
+//! Designed to match the Rust `reed-solomon-simd` crate's output format.
 
 pub const gf = @import("gf.zig");
 pub const fwht = @import("fwht.zig");

@@ -1,7 +1,7 @@
 //! Leopard-RS engine: FFT, IFFT, multiply, and shard operations.
 //!
 //! SIMD-accelerated using ARM NEON tbl / scalar fallback for GF(2^16) multiply.
-//! Uses 2-layer butterfly optimization for FFT/IFFT (processes 4 shards at once).
+//! Uses fused SIMD butterfly kernels inside iterative FFT/IFFT passes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -151,26 +151,6 @@ inline fn storeChunk(c: *Chunk, v0: V16, v1: V16, v2: V16, v3: V16) void {
     c[48..64].* = v3;
 }
 
-inline fn mulAdd(x: []Chunk, y: []const Chunk, lut: *const gf.Mul128) void {
-    const lo0: V16 = lut.lo[0];
-    const lo1: V16 = lut.lo[1];
-    const lo2: V16 = lut.lo[2];
-    const lo3: V16 = lut.lo[3];
-    const hi0: V16 = lut.hi[0];
-    const hi1: V16 = lut.hi[1];
-    const hi2: V16 = lut.hi[2];
-    const hi3: V16 = lut.hi[3];
-
-    for (x, y) |*xc, yc| {
-        const pl, const ph = simdMul16(yc[0..16].*, yc[32..48].*, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        xc[0..16].* = @as(V16, xc[0..16].*) ^ pl;
-        xc[32..48].* = @as(V16, xc[32..48].*) ^ ph;
-        const pl2, const ph2 = simdMul16(yc[16..32].*, yc[48..64].*, lo0, lo1, lo2, lo3, hi0, hi1, hi2, hi3);
-        xc[16..32].* = @as(V16, xc[16..32].*) ^ pl2;
-        xc[48..64].* = @as(V16, xc[48..64].*) ^ ph2;
-    }
-}
-
 inline fn mulInPlace(x: []Chunk, lut: *const gf.Mul128) void {
     if (comptime use_x86_avx2) {
         gf_mul_avx2(@ptrCast(x.ptr), lut, x.len);
@@ -272,7 +252,7 @@ const SharedTables = struct {
 };
 
 var shared_tables: SharedTables = undefined;
-var shared_tables_initialized = std.atomic.Value(bool).init(false);
+var shared_tables_once = std.once(initSharedTables);
 
 fn initSharedTables() void {
     const el = tables.initExpLog();
@@ -284,10 +264,7 @@ fn initSharedTables() void {
 }
 
 fn getSharedTables() *const SharedTables {
-    if (!shared_tables_initialized.load(.acquire)) {
-        initSharedTables();
-        shared_tables_initialized.store(true, .release);
-    }
+    shared_tables_once.call();
     return &shared_tables;
 }
 
@@ -397,6 +374,29 @@ test "Engine init" {
     var eng = try Engine.init(testing.allocator);
     defer eng.deinit();
     try testing.expectEqual(GF_MODULUS, eng.skew[0]);
+}
+
+test "Shared table initialization is safe across repeated concurrent init calls" {
+    if (builtin.single_threaded) {
+        var eng = try Engine.init(testing.allocator);
+        defer eng.deinit();
+        try testing.expectEqual(GF_MODULUS, eng.skew[0]);
+        return;
+    }
+
+    const Worker = struct {
+        fn run() void {
+            var eng = Engine.init(std.heap.page_allocator) catch @panic("Engine.init failed");
+            defer eng.deinit();
+            if (eng.skew[0] != GF_MODULUS) @panic("invalid shared table state");
+        }
+    };
+
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{});
+    }
+    for (threads) |thread| thread.join();
 }
 
 test "FFT then IFFT round-trip" {
